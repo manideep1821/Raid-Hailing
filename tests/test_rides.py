@@ -36,8 +36,8 @@ def clock():
 
 
 @pytest.fixture
-def c(clock):
-    return build_container(clock=clock)
+def c(repos, clock):
+    return build_container(repos, clock=clock)
 
 
 @pytest.fixture
@@ -60,8 +60,8 @@ def test_book_assigns_nearest_driver_of_requested_type(c, user):
 
     assert ride.driver_id == near.id
     assert ride.status == RideStatus.ONGOING
-    assert near.status == DriverStatus.ON_RIDE
-    assert far.status == DriverStatus.AVAILABLE
+    assert c.drivers.get(near.id).status == DriverStatus.ON_RIDE
+    assert c.drivers.get(far.id).status == DriverStatus.AVAILABLE
 
 
 def test_no_driver_within_radius(c, user):
@@ -143,8 +143,8 @@ def test_end_ride_minimum_fare_and_driver_released(c, user):
 
     assert ended.status == RideStatus.COMPLETED
     assert ended.fare == 50
-    assert driver.status == DriverStatus.AVAILABLE
-    assert driver.location == drop
+    assert c.drivers.get(driver.id).status == DriverStatus.AVAILABLE
+    assert c.drivers.get(driver.id).location == drop
 
 
 def test_distance_accumulates_from_location_updates(c, user):
@@ -164,7 +164,7 @@ def test_location_update_when_idle_does_not_touch_rides(c, user):
     driver = add_driver(c, CarType.SEDAN, km_away=3)
     new_loc = north_of(PICKUP, 0.2)
     c.drivers.update_location(driver.id, new_loc)
-    assert driver.location == new_loc
+    assert c.drivers.get(driver.id).location == new_loc
     assert c.rides.book(user.id, PICKUP, CarType.SEDAN).route == [PICKUP]
 
 
@@ -190,7 +190,7 @@ def test_invalid_coupon_rejects_booking_without_holding_driver(c, user):
     driver = add_driver(c, CarType.SEDAN)
     with pytest.raises(InvalidCouponError):
         c.rides.book(user.id, PICKUP, CarType.SEDAN, coupon_code="NOPE")
-    assert driver.status == DriverStatus.AVAILABLE
+    assert c.drivers.get(driver.id).status == DriverStatus.AVAILABLE
 
 
 def test_deleted_coupon_is_invalid_for_new_bookings_but_honoured_mid_ride(c, user):
@@ -247,7 +247,7 @@ def test_cancel_within_grace_is_free(c, user, clock):
     cancelled = c.rides.cancel(ride.id)
     assert cancelled.status == RideStatus.CANCELLED
     assert cancelled.cancellation_fee == 0
-    assert driver.status == DriverStatus.AVAILABLE
+    assert c.drivers.get(driver.id).status == DriverStatus.AVAILABLE
 
 
 def test_cancel_after_grace_charges_fee(c, user, clock):
@@ -262,7 +262,8 @@ def test_cancel_after_grace_charges_fee(c, user, clock):
 # --- concurrency ------------------------------------------------------------------
 
 def test_concurrent_bookings_never_share_a_driver(c):
-    add_driver(c, CarType.SEDAN)
+    # All users rank the same nearest driver first; losers must fall through to the next one.
+    drivers = [add_driver(c, CarType.SEDAN, km_away=k) for k in (0.5, 1, 2)]
     users = [c.users.register(f"u{i}", str(i)) for i in range(20)]
     results, errors = [], []
     barrier = threading.Barrier(len(users))
@@ -280,5 +281,5 @@ def test_concurrent_bookings_never_share_a_driver(c):
     for t in threads:
         t.join()
 
-    assert len(results) == 1
-    assert len(errors) == len(users) - 1
+    assert sorted(r.driver_id for r in results) == sorted(d.id for d in drivers)
+    assert len(errors) == len(users) - len(drivers)

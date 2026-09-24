@@ -4,7 +4,7 @@ from typing import Callable, Optional
 
 from app.matching import MatchingStrategy
 from app.pricing import DEFAULT_FARE_STRATEGIES, PricingEngine, SurgeStrategy
-from app.repository import CouponRepository, DriverRepository, RideRepository, UserRepository
+from app.repository import Repositories, in_memory_repositories
 from app.services import CouponService, DriverService, RideService, UserService
 
 
@@ -16,15 +16,15 @@ class Container:
     rides: RideService
 
 
-def build_container(surge: Optional[SurgeStrategy] = None, matching: Optional[MatchingStrategy] = None,
+def build_container(repos: Optional[Repositories] = None, surge: Optional[SurgeStrategy] = None,
+                    matching: Optional[MatchingStrategy] = None,
                     clock: Callable[[], datetime] = datetime.now) -> Container:
-    user_repo, driver_repo, ride_repo, coupon_repo = (
-        UserRepository(), DriverRepository(), RideRepository(), CouponRepository())
-    coupon_service = CouponService(coupon_repo)
+    repos = repos or in_memory_repositories()
+    coupon_service = CouponService(repos.coupons)
     return Container(
-        users=UserService(user_repo),
-        drivers=DriverService(driver_repo, ride_repo),
+        users=UserService(repos.users),
+        drivers=DriverService(repos.drivers, repos.rides),
         coupons=coupon_service,
-        rides=RideService(user_repo, driver_repo, ride_repo, coupon_service,
+        rides=RideService(repos.users, repos.drivers, repos.rides, coupon_service,
                           PricingEngine(DEFAULT_FARE_STRATEGIES, surge), matching, clock=clock),
     )
