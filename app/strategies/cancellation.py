@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 
-from app.models import Ride
+from app.domain.models import Ride
 
 
 class CancellationPolicy(ABC):

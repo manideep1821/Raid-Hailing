@@ -1,15 +1,12 @@
-from pathlib import Path
-
 import pytest
 
-from app.config import load_config
-from app.discounts import FlatDiscount, PercentageDiscount, build_discount
-from app.exceptions import ValidationError
-from app.models import CarType, Coupon, FareBreakdown, Location, Ride
-from app.pricing import PricingEngine, TieredFareStrategy
+from app.domain.discounts import FlatDiscount, PercentageDiscount
+from app.domain.exceptions import ValidationError
+from app.domain.models import CarType, Coupon, FareBreakdown, Ride
+from app.strategies.pricing import PricingEngine, TieredFareStrategy
+from tests.support import PICKUP, TEST_CONFIG
 
-PICKUP = Location(12.97, 77.59)
-FARES = load_config(Path(__file__).with_name("config.test.toml")).fare_strategies
+FARES = TEST_CONFIG.fare_strategies
 
 # Spec example: min 50, first 2 km @10, 3-5 km @8, 6+ km @5
 spec_tiers = TieredFareStrategy(min_fare=50, tiers=[(2, 10), (5, 8), (None, 5)])
@@ -77,8 +74,6 @@ def test_flat_coupon():
 
 
 def test_percentage_coupon_with_cap():
-    assert PercentageDiscount(10).amount(200) == 20
-    assert PercentageDiscount(50, max_discount=100).amount(1000) == 100
     engine = PricingEngine(FARES)
     assert engine.calculate(CarType.SEDAN, 10, coupon=Coupon("P50", PercentageDiscount(50, 30))).total == 59
 
@@ -104,21 +99,3 @@ def test_ride_is_priced_with_its_locked_surge_and_coupon():
     fare = PricingEngine(FARES).price_ride(
         ride(CarType.SEDAN, CarType.SEDAN, 10, surge=2, coupon=Coupon("P10", PercentageDiscount(10))))
     assert (fare.surged_fare, fare.discount, fare.total) == (178, 17.8, 160.2)
-
-
-@pytest.mark.parametrize("kind, params", [
-    ("flat", {"value": 0}),
-    ("flat", {"value": 10, "max_discount": 5}),     # flat takes no cap
-    ("percentage", {"value": 150}),
-    ("percentage", {"value": 10, "max_discount": -1}),
-    ("percentage", {"value": "ten"}),
-    ("bogo", {"value": 1}),
-])
-def test_invalid_discounts_rejected(kind, params):
-    with pytest.raises(ValidationError):
-        build_discount(kind, params)
-
-
-def test_discount_round_trips_through_its_params():
-    for discount in (FlatDiscount(25), PercentageDiscount(20, max_discount=30), PercentageDiscount(5)):
-        assert build_discount(discount.kind, discount.params()) == discount

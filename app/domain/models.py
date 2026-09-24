@@ -4,8 +4,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from app.discounts import Discount
-from app.exceptions import ValidationError
+from app.domain.discounts import Discount
+from app.domain.exceptions import ValidationError
 
 EARTH_RADIUS_KM = 6371.0
 

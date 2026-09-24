@@ -2,8 +2,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Callable
 
-from app.models import Location
-from app.repository import DriverRepository, RideRepository
+from app.domain.models import Location
+from app.storage.base import DriverRepository, RideRepository
 
 
 class SurgeStrategy(ABC):

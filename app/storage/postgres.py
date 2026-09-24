@@ -12,11 +12,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from app.exceptions import InvalidRideStateError, NotFoundError, ValidationError
-from app.discounts import build_discount
-from app.models import CarType, Coupon, Driver, DriverStatus, FareBreakdown, Location, Ride, RideStatus, User
-from app.repository import (CouponRepository, DriverRepository, Repositories, RideChange, RideRepository,
-                            UserRepository)
+from app.domain.discounts import build_discount
+from app.domain.exceptions import InvalidRideStateError, NotFoundError, ValidationError
+from app.domain.models import CarType, Coupon, Driver, DriverStatus, FareBreakdown, Location, Ride, RideStatus, User
+from app.storage.base import (CouponRepository, DriverRepository, Repositories, RideChange, RideRepository,
+                              UserRepository)
 
 SCHEMA = Path(__file__).with_name("schema.sql")
 SCHEMA_VERSION = 4

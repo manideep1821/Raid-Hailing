@@ -5,8 +5,10 @@
 ```bash
 docker compose up -d --wait            # Postgres 16 on localhost:5433 (dbs: rides, rides_test)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q                    # 160 tests; Postgres cases skip if the DB is down
-.venv/bin/python -m app.demo           # scripted walkthrough of every edge case, in memory
+.venv/bin/pytest -q                    # 203 tests; Postgres cases skip if the DB is down
+.venv/bin/pytest -q tests/unit         # fast unit tests only, no storage
+.venv/bin/pytest -q -m "not postgres"  # everything except the Postgres runs
+.venv/bin/python -m app.cli.demo       # scripted walkthrough of every edge case, in memory
 
 alias rides=".venv/bin/python -m app.cli"
 rides register-user --name Asha --phone 9000000001
@@ -48,18 +50,24 @@ The tests use their own pinned [`tests/config.test.toml`](tests/config.test.toml
 
 ## Layout
 
-| Layer | File | Responsibility |
-|---|---|---|
-| Domain | `app/models.py` | Entities, ride lifecycle, `FareBreakdown`, haversine distance, running ride distance |
-| Pricing | `app/pricing.py` | `FareStrategy` (tiered, per car type), `PricingEngine` (breakdown; bills the requested type) |
-| Discounts | `app/discounts.py` | `Discount` types (flat, percentage with cap) and their registry |
-| Surge | `app/surge.py` | `SurgeStrategy`: none, or demand/supply near the pickup |
-| Matching | `app/matching.py` | `MatchingStrategy`: nearest, highest-rated |
-| Cancellation | `app/cancellation.py` | `CancellationPolicy`: free inside a grace window, flat fee after |
-| Services | `app/services.py` | Use cases: register, book (with upgrade), end, cancel, history, coupons |
-| Storage | `app/repository.py`, `app/postgres.py`, `app/schema.sql` | Repository contracts + in-memory and Postgres implementations |
-| Config | `config.toml`, `app/config.py` | All tunable values; loaded + validated into typed `AppConfig` |
-| Wiring / UI | `app/container.py`, `app/cli.py`, `app/demo.py` | Builds services from `AppConfig`, argparse CLI + shell, scripted demo |
+```
+app/
+  domain/        models.py (entities, ride lifecycle, FareBreakdown, haversine), discounts.py, exceptions.py
+  strategies/    pricing.py, surge.py, matching.py, cancellation.py: each an interface + implementations
+  services/      one module per use case: users, drivers, coupons, rides (booking, upgrades, lifecycle)
+  storage/       base.py (repository contracts), memory.py, postgres.py + schema.sql
+  config.py      loads and validates config.toml into a typed AppConfig
+  container.py   composition root: the only place concrete strategies and stores are chosen
+  cli/           main.py (argparse CLI + shell), formatting.py, demo.py; `python -m app.cli`
+tests/
+  support.py     shared helpers: pinned test config, PICKUP, north_of(km), FakeClock, unique_phone()
+  conftest.py    fixtures: `repos` (in-memory and Postgres), `clock`, `c` (wired services)
+  unit/          no storage: pricing, discounts, domain model, matching, cancellation, upgrade chain,
+                 config validation, and the layering rules (test_architecture.py)
+  integration/   rides, surge and the CLI end to end; storage-backed tests run on both backends
+```
+
+Dependencies point one way: `domain` ← `strategies` ← `services` ← `container` ← `cli`, and services see storage only through the contracts in `storage/base.py`. `tests/unit/test_architecture.py` fails the build if a module imports from a layer it shouldn't, e.g. a service importing Postgres.
 
 ## Assumptions
 
@@ -82,7 +90,7 @@ The tests use their own pinned [`tests/config.test.toml`](tests/config.test.toml
 
 - **Strategies at each variation point.** Fare per car type, surge, matching, cancellation and coupon discounts are all interfaces injected into the services. Adding an SUV means one `CarType` value plus a `[pricing.suv]` section in `config.toml`, with no booking code touched; the config loader refuses to start if a car type has no pricing. The matching strategy is set by config and can be overridden per booking (`--strategy`).
 - **Upgrades are data** (`[booking.upgrades]`), not an `if` inside booking logic. Booking walks the chain; the config loader rejects cycles.
-- **Discount types are a registry.** A coupon stores `(kind, params)` as JSON, so a new type (e.g. "₹X off above ₹Y") is one dataclass in `app/discounts.py` plus its registry entry, with no schema change. Each type validates its own parameters.
+- **Discount types are a registry.** A coupon stores `(kind, params)` as JSON, so a new type (e.g. "₹X off above ₹Y") is one dataclass in `app/domain/discounts.py` plus its registry entry, with no schema change. Each type validates its own parameters.
 - **The fare is a breakdown** (base, surge, discount, total) stored on the ride, so the receipt explains itself. The rule "an upgrade is billed at the requested type" lives in `PricingEngine.price_ride`, next to the rest of the pricing.
 - **Config has no code fallbacks.** Services receive every value through their constructors, and `config.toml` is the single source of truth. Tests pin their own config file.
 - **Concurrency is enforced in storage, not in an app lock.** A CLI runs each command in a new process, so a `threading.Lock` would protect nothing. Instead:

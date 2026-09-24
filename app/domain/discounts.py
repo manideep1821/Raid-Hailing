@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, fields
 from typing import Any, ClassVar, Dict, Optional, Type
 
-from app.exceptions import ValidationError
+from app.domain.exceptions import ValidationError
 
 
 def _require(condition: bool, message: str) -> None:

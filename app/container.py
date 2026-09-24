@@ -2,13 +2,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
 
-from app.cancellation import GracePeriodCancellationPolicy
 from app.config import AppConfig
-from app.matching import MATCHING_STRATEGIES
-from app.pricing import PricingEngine
-from app.repository import Repositories, in_memory_repositories
-from app.services import CouponService, DriverService, RideService, UserService
-from app.surge import DemandSupplySurge, NoSurge
+from app.services.coupons import CouponService
+from app.services.drivers import DriverService
+from app.services.rides import RideService
+from app.services.users import UserService
+from app.storage.base import Repositories
+from app.storage.memory import in_memory_repositories
+from app.strategies.cancellation import GracePeriodCancellationPolicy
+from app.strategies.matching import MATCHING_STRATEGIES
+from app.strategies.pricing import PricingEngine
+from app.strategies.surge import DemandSupplySurge, NoSurge
 
 
 @dataclass

@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
-from app.exceptions import ValidationError
-from app.models import CarType, Coupon, FareBreakdown, Ride
+from app.domain.exceptions import ValidationError
+from app.domain.models import CarType, Coupon, FareBreakdown, Ride
 
 
 class FareStrategy(ABC):

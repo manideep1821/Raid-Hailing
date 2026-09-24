@@ -1,20 +1,19 @@
 import io
-from pathlib import Path
 
 import pytest
 
-from app import cli
-from app.config import load_config
+from app.cli import main as cli
 from app.container import build_container
+from tests.support import PICKUP, TEST_CONFIG, TEST_CONFIG_PATH, north_of
 
-TEST_CONFIG = Path(__file__).with_name("config.test.toml")
-PICKUP = ("--lat", "12.9716", "--lng", "77.5946")
-TEN_KM_NORTH = ("--lat", str(12.9716 + 10 / 111.19492664455873), "--lng", "77.5946")
+AT_PICKUP = ("--lat", str(PICKUP.lat), "--lng", str(PICKUP.lng))
+TEN_KM_NORTH = ("--lat", str(north_of(10).lat), "--lng", str(PICKUP.lng))
 
 
 @pytest.fixture
 def c():
-    return build_container(load_config(TEST_CONFIG))
+    """The CLI's logic doesn't depend on storage, so these run in memory only."""
+    return build_container(TEST_CONFIG)
 
 
 def call(c, *argv: str) -> str:
@@ -23,10 +22,10 @@ def call(c, *argv: str) -> str:
 
 def test_full_ride_through_the_cli(c):
     user = call(c, "register-user", "--name", "Asha", "--phone", "900").split()[2]
-    call(c, "register-driver", "--name", "Sam", "--phone", "911", "--car-type", "sedan", *PICKUP)
+    call(c, "register-driver", "--name", "Sam", "--phone", "911", "--car-type", "sedan", *AT_PICKUP)
     call(c, "add-coupon", "flat10", "--type", "flat", "--value", "10")
 
-    booked = call(c, "book", "--user", user, "--car-type", "hatchback", "--coupon", "FLAT10", *PICKUP)
+    booked = call(c, "book", "--user", user, "--car-type", "hatchback", "--coupon", "FLAT10", *AT_PICKUP)
     assert "car=sedan (upgraded from hatchback, billed as hatchback)" in booked
     ride_id = booked.split()[2]
     assert "[ongoing]" in call(c, "start", ride_id)
@@ -42,7 +41,7 @@ def test_full_ride_through_the_cli(c):
     (["register-driver", "--name", "S", "--phone", "1", "--car-type", "sedan", "--lat", "200", "--lng", "0"],
      "invalid coordinates"),
     (["add-coupon", "X", "--type", "flat", "--value", "10", "--max-discount", "5"], "does not take: max_discount"),
-    (["book", "--user", "U-missing", "--car-type", "sedan", *PICKUP], "user 'U-missing' not found"),
+    (["book", "--user", "U-missing", "--car-type", "sedan", *AT_PICKUP], "user 'U-missing' not found"),
 ])
 def test_domain_errors_are_reported_with_exit_code_1(c, capsys, argv, message):
     assert cli.execute(c, cli.build_parser().parse_args(argv)) == 1
@@ -50,7 +49,7 @@ def test_domain_errors_are_reported_with_exit_code_1(c, capsys, argv, message):
 
 
 def test_memory_shell_keeps_state_and_survives_bad_input(monkeypatch, capsys):
-    monkeypatch.setenv("RIDES_CONFIG", str(TEST_CONFIG))
+    monkeypatch.setenv("RIDES_CONFIG", str(TEST_CONFIG_PATH))
     monkeypatch.setattr("sys.stdin", io.StringIO(
         "register-user --name A --phone 1\n"
         "register-user --name B --phone 1\n"      # fails only if the first user is still there

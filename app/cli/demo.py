@@ -1,19 +1,19 @@
 """Scripted walkthrough of the main flows and edge cases, in memory (no Postgres needed):
 
-    python -m app.demo
+    python -m app.cli.demo
 
 Each scenario runs in a different city so that surge demand in one doesn't leak into another.
 """
 from datetime import datetime, timedelta
 from typing import Callable
 
-from app.cli import format_history, format_ride
+from app.cli.formatting import format_history, format_ride
 from app.config import load_config
 from app.container import build_container
-from app.discounts import PercentageDiscount
-from app.exceptions import RideHailingError
-from app.matching import HighestRatedDriverStrategy
-from app.models import CarType, Location, Ride
+from app.domain.discounts import PercentageDiscount
+from app.domain.exceptions import RideHailingError
+from app.domain.models import CarType, Location, Ride
+from app.strategies.matching import HighestRatedDriverStrategy
 
 KM_PER_DEG_LAT = 111.195
 

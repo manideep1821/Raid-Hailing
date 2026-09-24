@@ -1,49 +1,19 @@
 import itertools
 import threading
-from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 
-from app.config import load_config
-from app.container import build_container
-from app.exceptions import (InvalidCouponError, InvalidRideStateError, NoDriverAvailableError, NotFoundError,
-                            ValidationError)
-from app.discounts import FlatDiscount, PercentageDiscount
-from app.matching import HighestRatedDriverStrategy
-from app.models import CarType, DriverStatus, Location, Ride, RideStatus
-from app.services import upgrade_chain
-
-PICKUP = Location(12.9716, 77.5946)
-KM_PER_DEG_LAT = 111.19492664455873
-CONFIG = load_config(Path(__file__).with_name("config.test.toml"))
-PHONES = itertools.count(9100000000)  # phone numbers are unique per driver
-
-
-def north_of(loc: Location, km: float) -> Location:
-    return Location(loc.lat + km / KM_PER_DEG_LAT, loc.lng)
+from app.domain.discounts import FlatDiscount, PercentageDiscount
+from app.domain.exceptions import (InvalidCouponError, InvalidRideStateError, NoDriverAvailableError, NotFoundError,
+                                   ValidationError)
+from app.domain.models import CarType, DriverStatus, Ride, RideStatus
+from app.strategies.matching import HighestRatedDriverStrategy
+from tests.support import PICKUP, TEST_CONFIG, north_of, unique_phone
 
 
 def fare(car_type: CarType, km: float) -> float:
-    return round(CONFIG.fare_strategies[car_type].base_fare(km), 2)
-
-
-class FakeClock:
-    def __init__(self):
-        self.now = datetime(2026, 1, 1, 10, 0)
-
-    def __call__(self):
-        return self.now
-
-
-@pytest.fixture
-def clock():
-    return FakeClock()
-
-
-@pytest.fixture
-def c(repos, clock):
-    return build_container(CONFIG, repos, clock=clock)
+    return round(TEST_CONFIG.fare_strategies[car_type].base_fare(km), 2)
 
 
 @pytest.fixture
@@ -52,7 +22,7 @@ def user(c):
 
 
 def add_driver(c, car_type, km_away=1.0, rating=4.5, name="D"):
-    return c.drivers.register(name, str(next(PHONES)), car_type, north_of(PICKUP, km_away), rating)
+    return c.drivers.register(name, unique_phone(), car_type, north_of(km_away), rating)
 
 
 def complete(c, ride_id, drop=None):
@@ -83,10 +53,10 @@ def test_no_driver_within_radius(c, user):
 
 def test_driver_without_recent_location_is_treated_as_offline(c, user, clock):
     driver = add_driver(c, CarType.SEDAN)
-    clock.now += CONFIG.driver_timeout + timedelta(seconds=1)
+    clock.now += TEST_CONFIG.driver_timeout + timedelta(seconds=1)
     with pytest.raises(NoDriverAvailableError):
         c.rides.book(user.id, PICKUP, CarType.SEDAN)
-    c.drivers.update_location(driver.id, north_of(PICKUP, 1))     # heartbeat: back online
+    c.drivers.update_location(driver.id, north_of(1))     # heartbeat: back online
     assert c.rides.book(user.id, PICKUP, CarType.SEDAN).driver_id == driver.id
 
 
@@ -94,8 +64,8 @@ def test_ending_a_ride_counts_as_the_driver_being_seen(c, user, clock):
     driver = add_driver(c, CarType.SEDAN)
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
     c.rides.start(ride.id)
-    clock.now += CONFIG.driver_timeout      # a long ride with no updates
-    c.rides.end(ride.id, drop=north_of(PICKUP, 2))
+    clock.now += TEST_CONFIG.driver_timeout      # a long ride with no updates
+    c.rides.end(ride.id, drop=north_of(2))
     assert c.drivers.get(driver.id).last_seen_at == clock.now
     other = c.users.register("Ravi", "9000000002")
     assert c.rides.book(other.id, PICKUP, CarType.SEDAN).driver_id == driver.id
@@ -129,12 +99,6 @@ def test_unknown_user_rejected(c):
         c.rides.book("U-missing", PICKUP, CarType.SEDAN)
 
 
-@pytest.mark.parametrize("lat, lng", [(91, 0), (-90.5, 0), (0, 180.1), (200, 77)])
-def test_invalid_coordinates_rejected(lat, lng):
-    with pytest.raises(ValidationError, match="invalid coordinates"):
-        Location(lat, lng)
-
-
 def test_phone_number_is_registered_once_per_user_and_per_driver(c, user):
     with pytest.raises(ValidationError, match="already registered"):
         c.users.register("Asha again", user.phone)
@@ -160,7 +124,7 @@ def test_hatchback_upgraded_to_sedan_at_hatchback_price(c, user):
     assert ride.assigned_car_type == CarType.SEDAN
     assert ride.upgraded
 
-    ended = complete(c, ride.id, drop=north_of(PICKUP, 10))
+    ended = complete(c, ride.id, drop=north_of(10))
     assert ended.fare.total == pytest.approx(fare(CarType.HATCHBACK, 10), abs=0.05)
     assert ended.fare.total < fare(CarType.SEDAN, 10)
 
@@ -178,19 +142,12 @@ def test_sedan_is_never_downgraded(c, user):
         c.rides.book(user.id, PICKUP, CarType.SEDAN)
 
 
-def test_upgrade_chain_follows_the_path_and_stops_on_a_cycle():
-    # Plain strings stand in for car types: the chain logic is independent of the enum.
-    assert upgrade_chain("hatchback", {"hatchback": "sedan", "sedan": "suv"}) == ["hatchback", "sedan", "suv"]
-    assert upgrade_chain("suv", {"hatchback": "sedan", "sedan": "suv"}) == ["suv"]
-    assert upgrade_chain("a", {"a": "b", "b": "a"}) == ["a", "b"]
-
-
 # --- ending rides / location updates ---------------------------------------------
 
 def test_end_ride_minimum_fare_and_driver_released(c, user):
     driver = add_driver(c, CarType.HATCHBACK)
     ride = c.rides.book(user.id, PICKUP, CarType.HATCHBACK)
-    drop = north_of(PICKUP, 1)
+    drop = north_of(1)
 
     ended = complete(c, ride.id, drop=drop)
 
@@ -205,7 +162,7 @@ def test_distance_accumulates_from_location_updates(c, user):
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
     c.rides.start(ride.id)
     # Drive 4 km north, then 4 km back: 8 km travelled though drop == pickup.
-    c.drivers.update_location(driver.id, north_of(PICKUP, 4))
+    c.drivers.update_location(driver.id, north_of(4))
     c.drivers.update_location(driver.id, PICKUP)
 
     ended = c.rides.end(ride.id)
@@ -218,10 +175,10 @@ def test_driver_approach_to_pickup_is_not_billed(c, user):
     # Regression: updates sent on the way to the pickup used to be added to the rider's route.
     driver = add_driver(c, CarType.SEDAN, km_away=3)
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
-    c.drivers.update_location(driver.id, north_of(PICKUP, 1.5))
+    c.drivers.update_location(driver.id, north_of(1.5))
     c.drivers.update_location(driver.id, PICKUP)
     c.rides.start(ride.id)
-    ended = c.rides.end(ride.id, drop=north_of(PICKUP, 10))
+    ended = c.rides.end(ride.id, drop=north_of(10))
     assert ended.distance_km == pytest.approx(10, abs=0.01)
 
 
@@ -249,7 +206,7 @@ def test_no_location_update_is_lost_or_billed_after_the_ride_ends(c, repos, user
         for i in itertools.count():
             if stop.is_set():
                 return
-            point = north_of(PICKUP, 0.5 * (i % 4 + 1))
+            point = north_of(0.5 * (i % 4 + 1))
             if repos.rides.modify_ongoing_for_driver(driver.id, lambda r: r.move_to(point)) is not None:
                 applied.append(point)
             first_update_done.set()
@@ -270,7 +227,7 @@ def test_no_location_update_is_lost_or_billed_after_the_ride_ends(c, repos, user
 
 def test_location_update_when_idle_does_not_touch_rides(c, user):
     driver = add_driver(c, CarType.SEDAN, km_away=3)
-    new_loc = north_of(PICKUP, 0.2)
+    new_loc = north_of(0.2)
     c.drivers.update_location(driver.id, new_loc)
     assert c.drivers.get(driver.id).location == new_loc
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
@@ -291,7 +248,7 @@ def test_valid_coupon_discounts_fare(c, user):
     c.coupons.add("save20", PercentageDiscount(20))
     add_driver(c, CarType.HATCHBACK)
     ride = c.rides.book(user.id, PICKUP, CarType.HATCHBACK, coupon_code="SAVE20")
-    ended = complete(c, ride.id, drop=north_of(PICKUP, 10))
+    ended = complete(c, ride.id, drop=north_of(10))
     assert ended.fare.total == pytest.approx(fare(CarType.HATCHBACK, 10) * 0.8, abs=0.05)
 
 
@@ -336,7 +293,7 @@ def test_duplicate_coupon_and_missing_delete(c):
 def test_history_for_user_and_driver(c, user, clock):
     driver = add_driver(c, CarType.SEDAN)
     first = c.rides.book(user.id, PICKUP, CarType.SEDAN)
-    complete(c, first.id, drop=north_of(PICKUP, 3))
+    complete(c, first.id, drop=north_of(3))
     clock.now += timedelta(minutes=30)
     cancelled = c.rides.book(user.id, PICKUP, CarType.SEDAN)
     c.rides.cancel(cancelled.id)
@@ -426,9 +383,9 @@ def test_end_keeps_a_driver_location_newer_than_the_ride(c, repos, user, clock):
     driver = add_driver(c, CarType.SEDAN, km_away=0)
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
     c.rides.start(ride.id)
-    newer = north_of(PICKUP, 7)
+    newer = north_of(7)
     repos.drivers.update_location(driver.id, newer, clock.now + timedelta(seconds=1))
-    c.rides.end(ride.id, drop=north_of(PICKUP, 5))
+    c.rides.end(ride.id, drop=north_of(5))
     assert c.drivers.get(driver.id).location == newer
 
 

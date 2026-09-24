@@ -7,10 +7,10 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from app.exceptions import ValidationError
-from app.matching import MATCHING_STRATEGIES
-from app.models import CarType
-from app.pricing import FareStrategy, TieredFareStrategy
+from app.domain.exceptions import ValidationError
+from app.domain.models import CarType
+from app.strategies.matching import MATCHING_STRATEGIES
+from app.strategies.pricing import FareStrategy, TieredFareStrategy
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
 

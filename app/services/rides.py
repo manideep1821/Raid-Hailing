@@ -1,24 +1,15 @@
-import uuid
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
-from app.cancellation import CancellationPolicy
-from app.discounts import Discount
-from app.exceptions import InvalidCouponError, InvalidRideStateError, NoDriverAvailableError, ValidationError
-from app.matching import MatchingStrategy
-from app.models import CarType, Coupon, Driver, Location, Ride, RideStatus, User
-from app.pricing import PricingEngine
-from app.repository import CouponRepository, DriverRepository, RideRepository, UserRepository
-from app.surge import SurgeStrategy
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:8]}"
-
-
-def _require(condition: bool, message: str) -> None:
-    if not condition:
-        raise ValidationError(message)
+from app.domain.exceptions import InvalidRideStateError, NoDriverAvailableError
+from app.domain.models import CarType, Location, Ride, RideStatus
+from app.services.common import new_id, require
+from app.services.coupons import CouponService
+from app.storage.base import DriverRepository, RideRepository, UserRepository
+from app.strategies.cancellation import CancellationPolicy
+from app.strategies.matching import MatchingStrategy
+from app.strategies.pricing import PricingEngine
+from app.strategies.surge import SurgeStrategy
 
 
 def upgrade_chain(requested: CarType, upgrade_path: Dict[CarType, CarType]) -> List[CarType]:
@@ -29,58 +20,6 @@ def upgrade_chain(requested: CarType, upgrade_path: Dict[CarType, CarType]) -> L
         chain.append(upgrade)
         upgrade = upgrade_path.get(upgrade)
     return chain
-
-
-class UserService:
-    def __init__(self, users: UserRepository):
-        self.users = users
-
-    def register(self, name: str, phone: str) -> User:
-        _require(bool(name.strip()) and bool(phone.strip()), "name and phone are required")
-        return self.users.add(User(_new_id("U"), name.strip(), phone.strip()))
-
-
-class DriverService:
-    def __init__(self, drivers: DriverRepository, rides: RideRepository,
-                 clock: Callable[[], datetime] = datetime.now):
-        self.drivers = drivers
-        self.rides = rides
-        self.clock = clock
-
-    def register(self, name: str, phone: str, car_type: CarType, location: Location,
-                 rating: float = 5.0) -> Driver:
-        _require(bool(name.strip()) and bool(phone.strip()), "name and phone are required")
-        _require(0 <= rating <= 5, "rating must be between 0 and 5")
-        return self.drivers.add(Driver(_new_id("D"), name.strip(), phone.strip(), car_type, location, rating,
-                                       last_seen_at=self.clock()))
-
-    def get(self, driver_id: str) -> Driver:
-        return self.drivers.get(driver_id)
-
-    def update_location(self, driver_id: str, location: Location) -> Driver:
-        """Also a heartbeat, and, with a rider on board, adds the leg to the ride's distance."""
-        driver = self.drivers.update_location(driver_id, location, self.clock())
-        self.rides.modify_ongoing_for_driver(driver_id, lambda ride: ride.move_to(location))
-        return driver
-
-
-class CouponService:
-    def __init__(self, coupons: CouponRepository):
-        self.coupons = coupons
-
-    def add(self, code: str, discount: Discount) -> Coupon:
-        code = code.strip().upper()
-        _require(bool(code), "coupon code is required")
-        return self.coupons.add(Coupon(code, discount))
-
-    def delete(self, code: str) -> None:
-        self.coupons.delete(code.strip().upper())
-
-    def validate(self, code: str) -> Coupon:
-        coupon = self.coupons.find(code.strip().upper())
-        if coupon is None:
-            raise InvalidCouponError(f"coupon '{code}' is invalid or expired")
-        return coupon
 
 
 class RideService:
@@ -109,7 +48,7 @@ class RideService:
              matching: Optional[MatchingStrategy] = None) -> Ride:
         self.users.get(user_id)
         radius_km = self.default_radius_km if radius_km is None else radius_km
-        _require(radius_km > 0, "radius must be positive")
+        require(radius_km > 0, "radius must be positive")
         coupon = self.coupon_service.validate(coupon_code) if coupon_code else None
         if any(r.is_active for r in self.rides.for_user(user_id)):
             raise InvalidRideStateError("user already has an active ride")
@@ -121,7 +60,7 @@ class RideService:
             candidates = self.drivers.find_available(pickup, radius_km, seen_since, candidate_type)
             for driver in strategy.rank(candidates, pickup):
                 ride = Ride(
-                    id=_new_id("R"), user_id=user_id, driver_id=driver.id,
+                    id=new_id("R"), user_id=user_id, driver_id=driver.id,
                     requested_car_type=car_type, assigned_car_type=candidate_type,
                     pickup=pickup, last_location=pickup, coupon=coupon, surge_multiplier=surge_multiplier,
                     booked_at=self.clock(),

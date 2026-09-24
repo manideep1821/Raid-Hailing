@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List
 
-from app.models import Driver, Location
+from app.domain.models import Driver, Location
 
 
 class MatchingStrategy(ABC):

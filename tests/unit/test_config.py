@@ -1,19 +1,17 @@
 import copy
 import tomllib
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import pytest
 
 from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_config, parse_config
 from app.container import build_container
-from app.exceptions import NoDriverAvailableError
-from app.matching import HighestRatedDriverStrategy
-from app.models import CarType, Location
+from app.domain.exceptions import NoDriverAvailableError
+from app.domain.models import CarType
+from app.strategies.matching import HighestRatedDriverStrategy
+from tests.support import PICKUP, TEST_CONFIG_PATH, north_of
 
-TEST_CONFIG_PATH = Path(__file__).with_name("config.test.toml")
 BASE = tomllib.loads(TEST_CONFIG_PATH.read_text())
-PICKUP = Location(12.9716, 77.5946)
 
 
 def with_changes(mutate) -> dict:
@@ -97,7 +95,7 @@ def container_with(mutate, clock=datetime.now):
 
 def setup(c, car_type=CarType.SEDAN, km_north=3.0, rating=4.5):
     user = c.users.register("Asha", "900")
-    driver = c.drivers.register("Sam", "911", car_type, Location(PICKUP.lat + km_north / 111.195, PICKUP.lng), rating)
+    driver = c.drivers.register("Sam", "911", car_type, north_of(km_north), rating)
     return user, driver
 
 
@@ -112,7 +110,7 @@ def test_default_radius_from_config():
 def test_default_matching_strategy_from_config():
     c = container_with(lambda r: r["booking"].update(default_matching_strategy="highest_rated"))
     user, _ = setup(c, km_north=0.5, rating=3.0)
-    best = c.drivers.register("Top", "912", CarType.SEDAN, Location(PICKUP.lat + 0.03, PICKUP.lng), 4.9)
+    best = c.drivers.register("Top", "912", CarType.SEDAN, north_of(3.3), 4.9)
     assert isinstance(c.rides.matching, HighestRatedDriverStrategy)
     assert c.rides.book(user.id, PICKUP, CarType.SEDAN).driver_id == best.id
 
@@ -145,5 +143,5 @@ def test_prices_from_config():
     user, driver = setup(c, km_north=0)
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
     c.rides.start(ride.id)
-    ended = c.rides.end(ride.id, drop=Location(PICKUP.lat + 20 / 111.195, PICKUP.lng))
+    ended = c.rides.end(ride.id, drop=north_of(20))
     assert ended.fare.total == pytest.approx(20, abs=0.05)

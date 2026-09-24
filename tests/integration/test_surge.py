@@ -1,41 +1,13 @@
-import itertools
 from dataclasses import replace
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import timedelta
 
 import pytest
 
-from app.config import SurgeConfig, load_config
+from app.config import SurgeConfig
 from app.container import build_container
-from app.models import CarType, Location
-from app.surge import DemandSupplySurge
-
-PICKUP = Location(12.9716, 77.5946)
-KM_PER_DEG_LAT = 111.19492664455873
-CONFIG = load_config(Path(__file__).with_name("config.test.toml"))
-PHONES = itertools.count(9000000000)  # phone numbers are unique per user and per driver
-
-
-def north_of(km: float) -> Location:
-    return Location(PICKUP.lat + km / KM_PER_DEG_LAT, PICKUP.lng)
-
-
-class FakeClock:
-    def __init__(self):
-        self.now = datetime(2026, 1, 1, 10, 0)
-
-    def __call__(self):
-        return self.now
-
-
-@pytest.fixture
-def clock():
-    return FakeClock()
-
-
-@pytest.fixture
-def c(repos, clock):
-    return build_container(CONFIG, repos, clock=clock)
+from app.domain.models import CarType
+from app.strategies.surge import DemandSupplySurge
+from tests.support import PICKUP, TEST_CONFIG, north_of, unique_phone
 
 
 @pytest.fixture
@@ -45,13 +17,13 @@ def surge(repos, clock):
 
 
 def add_drivers(c, n, km=0.5, car_type=CarType.SEDAN):
-    return [c.drivers.register(f"D{i}", str(next(PHONES)), car_type, north_of(km), 4.5) for i in range(n)]
+    return [c.drivers.register(f"D{i}", unique_phone(), car_type, north_of(km), 4.5) for i in range(n)]
 
 
 def book(c, n):
     rides = []
     for i in range(n):
-        user = c.users.register(f"u{i}", str(next(PHONES)))
+        user = c.users.register(f"u{i}", unique_phone())
         rides.append(c.rides.book(user.id, PICKUP, CarType.SEDAN))
     return rides
 
@@ -114,7 +86,7 @@ def test_old_or_far_bookings_are_not_demand(c, surge, clock):
 
 def test_demand_counts_riders_not_bookings(c, surge):
     add_drivers(c, 3)
-    user = c.users.register("Asha", str(next(PHONES)))
+    user = c.users.register("Asha", unique_phone())
     for _ in range(3):                           # the same rider books and cancels three times
         c.rides.cancel(c.rides.book(user.id, PICKUP, CarType.SEDAN).id)
     assert surge.multiplier(PICKUP, user.id) == 1.0       # their own bookings don't count
@@ -122,7 +94,7 @@ def test_demand_counts_riders_not_bookings(c, surge):
 
 
 def test_booking_locks_the_surge_onto_the_ride_and_the_fare(repos, clock):
-    config = replace(CONFIG, surge=SurgeConfig(enabled=True, area_radius_km=2, window=timedelta(minutes=15), cap=2.0))
+    config = replace(TEST_CONFIG, surge=SurgeConfig(enabled=True, area_radius_km=2, window=timedelta(minutes=15), cap=2.0))
     c = build_container(config, repos, clock=clock)
     add_drivers(c, 2)
     first, second = book(c, 2)                   # second: demand 2, supply 1
