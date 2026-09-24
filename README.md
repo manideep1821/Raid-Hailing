@@ -2,6 +2,8 @@
 
 ## Run it
 
+Needs **Python 3.11+** (the config loader uses `tomllib`) and **Docker with Compose v2** (for `--wait`). Commands are for macOS/Linux; on Windows use `.venv\Scripts\` instead of `.venv/bin/`. If port 5433 is taken, start Postgres with `POSTGRES_PORT=5434` and point the app and tests at it with `DATABASE_URL=postgresql://rides:rides@localhost:5434/rides` and `TEST_DATABASE_URL=postgresql://rides:rides@localhost:5434/rides_test`.
+
 ```bash
 docker compose up -d --wait            # Postgres 16 on localhost:5433 (dbs: rides, rides_test)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
