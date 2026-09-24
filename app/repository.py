@@ -40,7 +40,8 @@ class DriverRepository(ABC):
         """Atomically AVAILABLE -> ON_RIDE. False if someone else got there first."""
 
     @abstractmethod
-    def release(self, driver_id: str, location: Location) -> None: ...
+    def release(self, driver_id: str, location: Optional[Location] = None) -> None:
+        """Mark AVAILABLE; move to `location` if given, else keep the current location."""
 
 
 class RideRepository(ABC):
@@ -138,11 +139,12 @@ class InMemoryDriverRepository(DriverRepository):
             driver.status = DriverStatus.ON_RIDE
             return True
 
-    def release(self, driver_id: str, location: Location) -> None:
+    def release(self, driver_id: str, location: Optional[Location] = None) -> None:
         with self._lock:
             driver = self._items[driver_id]
             driver.status = DriverStatus.AVAILABLE
-            driver.location = location
+            if location is not None:
+                driver.location = location
 
 
 class InMemoryRideRepository(RideRepository):

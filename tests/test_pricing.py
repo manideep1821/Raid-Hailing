@@ -1,11 +1,14 @@
+from pathlib import Path
+
 import pytest
 
+from app.config import load_config
 from app.exceptions import ValidationError
 from app.models import CarType, Coupon, DiscountType, Location
-from app.pricing import (DEFAULT_FARE_STRATEGIES, GridDemandSurge, PricingEngine, TieredFareStrategy,
-                         apply_coupon)
+from app.pricing import GridDemandSurge, PricingEngine, TieredFareStrategy, apply_coupon
 
 PICKUP = Location(12.97, 77.59)
+FARES = load_config(Path(__file__).with_name("config.test.toml")).fare_strategies
 
 # Spec example: min 50, first 2 km @10, 3-5 km @8, 6+ km @5
 spec_tiers = TieredFareStrategy(min_fare=50, tiers=[(2, 10), (5, 8), (None, 5)])
@@ -46,7 +49,7 @@ def test_invalid_tier_config_rejected(tiers):
 
 
 def test_car_types_have_different_rates():
-    engine = PricingEngine(DEFAULT_FARE_STRATEGIES)
+    engine = PricingEngine(FARES)
     hatch = engine.calculate(CarType.HATCHBACK, 10, PICKUP)
     sedan = engine.calculate(CarType.SEDAN, 10, PICKUP)
     assert hatch == 69           # 2*10 + 3*8 + 5*5
@@ -70,7 +73,7 @@ def test_coupon_never_makes_fare_negative():
 
 
 def test_coupon_applies_after_minimum_fare():
-    engine = PricingEngine(DEFAULT_FARE_STRATEGIES)
+    engine = PricingEngine(FARES)
     coupon = Coupon("FLAT10", DiscountType.FLAT, 10)
     assert engine.calculate(CarType.HATCHBACK, 1, PICKUP, coupon) == 40
 
@@ -78,7 +81,7 @@ def test_coupon_applies_after_minimum_fare():
 def test_surge_multiplies_before_coupon():
     surge = GridDemandSurge(cap=3.0)
     surge.record_demand_supply(PICKUP, demand=15, supply=10)       # 1.5x
-    engine = PricingEngine(DEFAULT_FARE_STRATEGIES, surge)
+    engine = PricingEngine(FARES, surge)
     coupon = Coupon("FLAT5", DiscountType.FLAT, 5)
     assert engine.calculate(CarType.HATCHBACK, 10, PICKUP) == pytest.approx(103.5)
     assert engine.calculate(CarType.HATCHBACK, 10, PICKUP, coupon) == pytest.approx(98.5)

@@ -82,9 +82,12 @@ class PostgresDriverRepository(_Base, DriverRepository):
         return self._exec("UPDATE drivers SET status = 'on_ride' WHERE id = %s AND status = 'available'",
                           (driver_id,)) == 1
 
-    def release(self, driver_id: str, location: Location) -> None:
-        self._exec("UPDATE drivers SET status = 'available', lat = %s, lng = %s WHERE id = %s",
-                   (location.lat, location.lng, driver_id))
+    def release(self, driver_id: str, location: Optional[Location] = None) -> None:
+        if location is None:
+            self._exec("UPDATE drivers SET status = 'available' WHERE id = %s", (driver_id,))
+        else:
+            self._exec("UPDATE drivers SET status = 'available', lat = %s, lng = %s WHERE id = %s",
+                       (location.lat, location.lng, driver_id))
 
 
 def _coupon_json(coupon: Optional[Coupon]):

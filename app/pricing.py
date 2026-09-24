@@ -89,9 +89,3 @@ class PricingEngine:
         if coupon:
             fare = apply_coupon(fare, coupon)
         return round(fare, 2)
-
-
-DEFAULT_FARE_STRATEGIES: Dict[CarType, FareStrategy] = {
-    CarType.HATCHBACK: TieredFareStrategy(min_fare=50, tiers=[(2, 10), (5, 8), (None, 5)]),
-    CarType.SEDAN: TieredFareStrategy(min_fare=60, tiers=[(2, 12), (5, 10), (None, 7)]),
-}

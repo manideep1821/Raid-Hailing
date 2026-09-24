@@ -1,14 +1,12 @@
 import argparse
-import os
 import sys
 from typing import Dict, List
 
+from app.config import ConfigError, load_config
 from app.container import Container, build_container
 from app.exceptions import RideHailingError
 from app.matching import MATCHING_STRATEGIES
 from app.models import CarType, DiscountType, Location, Ride
-
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://rides:rides@localhost:5433/rides")
 
 
 def format_ride(r: Ride) -> str:
@@ -60,9 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("book")
     s.add_argument("--user", required=True)
     s.add_argument("--car-type", choices=[t.value for t in CarType], required=True)
-    s.add_argument("--radius", type=float, default=5.0, help="search radius in km")
+    s.add_argument("--radius", type=float, help="search radius in km (default: from config)")
     s.add_argument("--coupon")
-    s.add_argument("--strategy", choices=list(MATCHING_STRATEGIES), default="nearest")
+    s.add_argument("--strategy", choices=list(MATCHING_STRATEGIES), help="default: from config")
     loc(s)
 
     s = sub.add_parser("end", help="end a ride; --lat/--lng is the drop point")
@@ -101,7 +99,7 @@ def run(c: Container, a: argparse.Namespace) -> str:
         return f"driver {d.id} now at ({d.location.lat}, {d.location.lng}) [{d.status.value}]"
     if a.command == "book":
         ride = c.rides.book(a.user, Location(a.lat, a.lng), CarType(a.car_type), a.radius, a.coupon,
-                            MATCHING_STRATEGIES[a.strategy])
+                            MATCHING_STRATEGIES[a.strategy] if a.strategy else None)
         return "booked " + format_ride(ride)
     if a.command == "end":
         drop = Location(a.lat, a.lng) if a.lat is not None and a.lng is not None else None
@@ -124,16 +122,22 @@ def run(c: Container, a: argparse.Namespace) -> str:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+
     from psycopg_pool import PoolTimeout
 
     from app.postgres import open_pool, postgres_repositories
     try:
-        pool = open_pool(DATABASE_URL, max_size=2)
+        pool = open_pool(config.database_url, max_size=config.db_pool_size)
     except PoolTimeout:
-        print(f"error: cannot reach Postgres at {DATABASE_URL}; run `docker compose up -d`", file=sys.stderr)
+        print(f"error: cannot reach Postgres at {config.database_url}; run `docker compose up -d`", file=sys.stderr)
         return 2
     try:
-        print(run(build_container(postgres_repositories(pool)), args))
+        print(run(build_container(config, postgres_repositories(pool)), args))
         return 0
     except RideHailingError as e:
         print(f"error: {e}", file=sys.stderr)

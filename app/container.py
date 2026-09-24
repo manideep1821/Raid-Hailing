@@ -2,8 +2,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
 
-from app.matching import MatchingStrategy
-from app.pricing import DEFAULT_FARE_STRATEGIES, PricingEngine, SurgeStrategy
+from app.cancellation import GracePeriodCancellationPolicy
+from app.config import AppConfig
+from app.matching import MATCHING_STRATEGIES
+from app.pricing import GridDemandSurge, NoSurge, PricingEngine, SurgeStrategy
 from app.repository import Repositories, in_memory_repositories
 from app.services import CouponService, DriverService, RideService, UserService
 
@@ -16,15 +18,25 @@ class Container:
     rides: RideService
 
 
-def build_container(repos: Optional[Repositories] = None, surge: Optional[SurgeStrategy] = None,
-                    matching: Optional[MatchingStrategy] = None,
+def build_container(config: AppConfig, repos: Optional[Repositories] = None,
+                    surge: Optional[SurgeStrategy] = None,
                     clock: Callable[[], datetime] = datetime.now) -> Container:
     repos = repos or in_memory_repositories()
+    if surge is None:
+        surge = (GridDemandSurge(config.surge.cell_size_deg, config.surge.cap)
+                 if config.surge.enabled else NoSurge())
     coupon_service = CouponService(repos.coupons)
     return Container(
         users=UserService(repos.users),
         drivers=DriverService(repos.drivers, repos.rides),
         coupons=coupon_service,
-        rides=RideService(repos.users, repos.drivers, repos.rides, coupon_service,
-                          PricingEngine(DEFAULT_FARE_STRATEGIES, surge), matching, clock=clock),
+        rides=RideService(
+            repos.users, repos.drivers, repos.rides, coupon_service,
+            pricing=PricingEngine(config.fare_strategies, surge),
+            matching=MATCHING_STRATEGIES[config.default_matching_strategy],
+            cancellation=GracePeriodCancellationPolicy(config.cancellation_grace, config.cancellation_fee),
+            upgrade_path=config.upgrade_path,
+            default_radius_km=config.default_radius_km,
+            clock=clock,
+        ),
     )

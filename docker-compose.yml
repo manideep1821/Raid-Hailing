@@ -2,16 +2,16 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: rides
-      POSTGRES_PASSWORD: rides
-      POSTGRES_DB: rides
+      POSTGRES_USER: ${POSTGRES_USER:-rides}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rides}
+      POSTGRES_DB: ${POSTGRES_DB:-rides}
     ports:
-      - "5433:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/create-test-db.sql:/docker-entrypoint-initdb.d/create-test-db.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rides -d rides"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-rides} -d $${POSTGRES_DB:-rides}"]
       interval: 2s
       timeout: 3s
       retries: 20

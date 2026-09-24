@@ -1,17 +1,19 @@
 import threading
+from pathlib import Path
 from datetime import datetime, timedelta
 
 import pytest
 
+from app.config import load_config
 from app.container import build_container
 from app.exceptions import (InvalidCouponError, InvalidRideStateError, NoDriverAvailableError, NotFoundError,
                             ValidationError)
 from app.matching import HighestRatedDriverStrategy
 from app.models import CarType, DiscountType, DriverStatus, Location, RideStatus
-from app.pricing import DEFAULT_FARE_STRATEGIES
 
 PICKUP = Location(12.9716, 77.5946)
 KM_PER_DEG_LAT = 111.19492664455873
+CONFIG = load_config(Path(__file__).with_name("config.test.toml"))
 
 
 def north_of(loc: Location, km: float) -> Location:
@@ -19,7 +21,7 @@ def north_of(loc: Location, km: float) -> Location:
 
 
 def fare(car_type: CarType, km: float) -> float:
-    return round(DEFAULT_FARE_STRATEGIES[car_type].base_fare(km), 2)
+    return round(CONFIG.fare_strategies[car_type].base_fare(km), 2)
 
 
 class FakeClock:
@@ -37,7 +39,7 @@ def clock():
 
 @pytest.fixture
 def c(repos, clock):
-    return build_container(repos, clock=clock)
+    return build_container(CONFIG, repos, clock=clock)
 
 
 @pytest.fixture
@@ -248,6 +250,17 @@ def test_cancel_within_grace_is_free(c, user, clock):
     assert cancelled.status == RideStatus.CANCELLED
     assert cancelled.cancellation_fee == 0
     assert c.drivers.get(driver.id).status == DriverStatus.AVAILABLE
+
+
+def test_cancel_leaves_driver_where_they_are(c, user):
+    driver = add_driver(c, CarType.SEDAN, km_away=3)
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.rides.cancel(ride.id)
+    # Regression: the driver used to be "released" at the pickup point they never reached.
+    assert c.drivers.get(driver.id).location == driver.location
+    other = c.users.register("Ravi", "9000000002")
+    with pytest.raises(NoDriverAvailableError):
+        c.rides.book(other.id, PICKUP, CarType.SEDAN, radius_km=1)
 
 
 def test_cancel_after_grace_charges_fee(c, user, clock):

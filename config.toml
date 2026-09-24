@@ -1,0 +1,41 @@
+# Runtime configuration. Override the file with RIDES_CONFIG=/path/to/file.toml
+# and the database URL with DATABASE_URL.
+
+[booking]
+default_radius_km = 5.0
+default_matching_strategy = "nearest"   # nearest | highest_rated
+
+# Requested type -> type substituted at the requested type's price when none is free.
+[booking.upgrades]
+hatchback = "sedan"
+
+# Slab pricing: each km is charged at the rate of the slab it falls in.
+# `up_to_km` is a cumulative bound; the last tier has none (open-ended).
+[pricing.hatchback]
+min_fare = 50
+tiers = [
+    { up_to_km = 2, rate_per_km = 10 },
+    { up_to_km = 5, rate_per_km = 8 },
+    { rate_per_km = 5 },
+]
+
+[pricing.sedan]
+min_fare = 60
+tiers = [
+    { up_to_km = 2, rate_per_km = 12 },
+    { up_to_km = 5, rate_per_km = 10 },
+    { rate_per_km = 7 },
+]
+
+[cancellation]
+grace_period_minutes = 2   # free to cancel within this window after booking
+fee = 25
+
+[surge]
+enabled = false
+cell_size_deg = 0.01       # grid cell (~1.1 km) that demand/supply is tracked per
+cap = 3.0
+
+[database]
+url = "postgresql://rides:rides@localhost:5433/rides"
+pool_size = 2
