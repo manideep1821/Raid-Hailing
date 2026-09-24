@@ -9,7 +9,6 @@ from app.services.rides import RideService
 from app.services.users import UserService
 from app.storage.base import Repositories
 from app.storage.memory import in_memory_repositories
-from app.strategies.cancellation import GracePeriodCancellationPolicy
 from app.strategies.matching import MATCHING_STRATEGIES
 from app.strategies.pricing import PricingEngine
 from app.strategies.surge import DemandSupplySurge, NoSurge
@@ -33,14 +32,14 @@ def build_container(config: AppConfig, repos: Optional[Repositories] = None,
     coupon_service = CouponService(repos.coupons)
     return Container(
         users=UserService(repos.users),
-        drivers=DriverService(repos.drivers, repos.rides, clock),
+        drivers=DriverService(repos.drivers, clock),
         coupons=coupon_service,
         rides=RideService(
             repos.users, repos.drivers, repos.rides, coupon_service,
             pricing=PricingEngine(config.fare_strategies),
             surge=surge,
             matching=MATCHING_STRATEGIES[config.default_matching_strategy],
-            cancellation=GracePeriodCancellationPolicy(config.cancellation_grace, config.cancellation_fee),
+            cancellation=config.cancellation_policy,
             upgrade_path=config.upgrade_path,
             default_radius_km=config.default_radius_km,
             driver_timeout=config.driver_timeout,

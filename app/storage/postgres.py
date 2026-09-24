@@ -92,12 +92,23 @@ class PostgresDriverRepository(_Base, DriverRepository):
         drivers = [_driver(r) for r in rows]
         return [d for d in drivers if d.location.distance_km(pickup) <= radius_km]
 
-    def update_location(self, driver_id: str, location: Location, seen_at: datetime) -> Driver:
-        row = self._one("UPDATE drivers SET lat = %s, lng = %s, last_seen_at = %s WHERE id = %s RETURNING *",
-                        (location.lat, location.lng, seen_at, driver_id))
-        if row is None:
-            raise NotFoundError(f"driver '{driver_id}' not found")
-        return _driver(row)
+    def update_location(self, driver_id: str, location: Location, seen_at: datetime,
+                        ride_change: Optional[RideChange] = None) -> Driver:
+        with self.pool.connection() as conn, conn.transaction():
+            # Locks the ride before the driver, the same order as closing a ride, so a location
+            # update and an `end` for the same driver can't deadlock.
+            if ride_change:
+                ride_row = conn.execute("SELECT * FROM rides WHERE driver_id = %s AND status = 'ongoing' FOR UPDATE",
+                                        (driver_id,)).fetchone()
+                if ride_row:
+                    ride = _ride(ride_row)
+                    ride_change(ride)
+                    _save_ride(conn, ride)
+            row = conn.execute("UPDATE drivers SET lat = %s, lng = %s, last_seen_at = %s WHERE id = %s RETURNING *",
+                               (location.lat, location.lng, seen_at, driver_id)).fetchone()
+            if row is None:
+                raise NotFoundError(f"driver '{driver_id}' not found")  # rolls back the ride change too
+            return _driver(row)
 
 
 def _coupon_json(coupon: Optional[Coupon]):
@@ -124,6 +135,15 @@ def _ride(row: dict) -> Ride:
         distance_km=row["distance_km"], fare=FareBreakdown(**fare) if fare else None,
         cancellation_fee=row["cancellation_fee"],
     )
+
+
+def _save_ride(conn, ride: Ride) -> None:
+    conn.execute(
+        "UPDATE rides SET status = %s, picked_up_at = %s, ended_at = %s, last_lat = %s, last_lng = %s, "
+        "distance_km = %s, fare = %s, cancellation_fee = %s WHERE id = %s",
+        (ride.status.value, ride.picked_up_at, ride.ended_at, ride.last_location.lat,
+         ride.last_location.lng, ride.distance_km, Jsonb(asdict(ride.fare)) if ride.fare else None,
+         ride.cancellation_fee, ride.id))
 
 
 class PostgresRideRepository(_Base, RideRepository):
@@ -165,29 +185,15 @@ class PostgresRideRepository(_Base, RideRepository):
                     if Location(r["pickup_lat"], r["pickup_lng"]).distance_km(pickup) <= radius_km})
 
     def modify(self, ride_id: str, change: RideChange) -> Ride:
-        ride = self._locked("id = %s", ride_id, change)
-        if ride is None:
-            raise NotFoundError(f"ride '{ride_id}' not found")
-        return ride
-
-    def modify_ongoing_for_driver(self, driver_id: str, change: RideChange) -> Optional[Ride]:
-        return self._locked("driver_id = %s AND status = 'ongoing'", driver_id, change)
-
-    def _locked(self, where: str, param: str, change: RideChange) -> Optional[Ride]:
         """Row lock held until commit; if `change` raises, the transaction rolls back."""
         with self.pool.connection() as conn, conn.transaction():
-            row = conn.execute(f"SELECT * FROM rides WHERE {where} FOR UPDATE", (param,)).fetchone()
+            row = conn.execute("SELECT * FROM rides WHERE id = %s FOR UPDATE", (ride_id,)).fetchone()
             if row is None:
-                return None
+                raise NotFoundError(f"ride '{ride_id}' not found")
             ride = _ride(row)
             was_active = ride.is_active
             change(ride)
-            conn.execute(
-                "UPDATE rides SET status = %s, picked_up_at = %s, ended_at = %s, last_lat = %s, last_lng = %s, "
-                "distance_km = %s, fare = %s, cancellation_fee = %s WHERE id = %s",
-                (ride.status.value, ride.picked_up_at, ride.ended_at, ride.last_location.lat,
-                 ride.last_location.lng, ride.distance_km, Jsonb(asdict(ride.fare)) if ride.fare else None,
-                 ride.cancellation_fee, ride.id))
+            _save_ride(conn, ride)
             if was_active and not ride.is_active:
                 conn.execute("UPDATE drivers SET status = 'available' WHERE id = %s", (ride.driver_id,))
                 if ride.status == RideStatus.COMPLETED:

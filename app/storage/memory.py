@@ -75,9 +75,16 @@ class InMemoryDriverRepository(DriverRepository):
                 and d.location.distance_km(pickup) <= radius_km
             ]
 
-    def update_location(self, driver_id: str, location: Location, seen_at: datetime) -> Driver:
+    def update_location(self, driver_id: str, location: Location, seen_at: datetime,
+                        ride_change: Optional[RideChange] = None) -> Driver:
         with self.db.lock:
             _get(self.db.drivers, driver_id, "driver")
+            ongoing = next((r for r in self.db.rides.values()
+                            if r.driver_id == driver_id and r.status == RideStatus.ONGOING), None)
+            if ride_change and ongoing:
+                ride = copy.deepcopy(ongoing)
+                ride_change(ride)             # if this raises, nothing below runs: neither write happens
+                self.db.rides[ride.id] = ride
             driver = self.db.drivers[driver_id]
             driver.location = location
             driver.last_seen_at = seen_at
@@ -120,13 +127,6 @@ class InMemoryRideRepository(RideRepository):
     def modify(self, ride_id: str, change: RideChange) -> Ride:
         with self.db.lock:
             return self._apply(_get(self.db.rides, ride_id, "ride"), change)
-
-    def modify_ongoing_for_driver(self, driver_id: str, change: RideChange) -> Optional[Ride]:
-        with self.db.lock:
-            for r in self.db.rides.values():
-                if r.driver_id == driver_id and r.status == RideStatus.ONGOING:
-                    return self._apply(copy.deepcopy(r), change)
-            return None
 
     def _apply(self, ride: Ride, change: RideChange) -> Ride:
         """`ride` is a copy, so if `change` raises, nothing is saved. Caller holds the lock."""

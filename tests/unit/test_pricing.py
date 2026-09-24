@@ -17,8 +17,10 @@ no_min_tiers = TieredFareStrategy(min_fare=0, tiers=[(2, 10), (5, 8), (None, 5)]
     (0, 0),
     (1, 10),            # within tier 1
     (2, 20),            # tier 1 boundary
+    (2.1, 20.8),        # just past it: the 0.1 km is at tier 2's rate
     (3, 28),            # 2*10 + 1*8
     (5, 44),            # tier 2 boundary: 20 + 3*8
+    (5.1, 44.5),        # just past it: the 0.1 km is at tier 3's rate
     (6, 49),            # 44 + 1*5
     (10, 69),           # 44 + 5*5
     (2.5, 24),          # fractional km
@@ -30,6 +32,8 @@ def test_tier_slabs(distance, expected):
 @pytest.mark.parametrize("distance, expected", [
     (0, 50), (1, 50), (5, 50),   # below minimum -> minimum fare
     (6, 50),                      # 49 still below min
+    (6.2, 50),                    # 44 + 1.2*5 = 50: where the tiers reach the minimum
+    (6.3, 50.5),                  # first distance that costs more than the minimum
     (7, 54),                      # 54 exceeds min
 ])
 def test_minimum_fare(distance, expected):
@@ -99,3 +103,16 @@ def test_ride_is_priced_with_its_locked_surge_and_coupon():
     fare = PricingEngine(FARES).price_ride(
         ride(CarType.SEDAN, CarType.SEDAN, 10, surge=2, coupon=Coupon("P10", PercentageDiscount(10))))
     assert (fare.surged_fare, fare.discount, fare.total) == (178, 17.8, 160.2)
+
+
+def test_percentage_coupon_on_a_minimum_fare_ride():
+    # The percentage applies to the minimum fare, not to the smaller distance fare (10 for 1 km).
+    fare = PricingEngine(FARES).calculate(CarType.HATCHBACK, 1, coupon=Coupon("P20", PercentageDiscount(20)))
+    assert (fare.base_fare, fare.discount, fare.total) == (50, 10, 40)
+
+
+def test_upgrade_with_surge_and_coupon_is_billed_at_the_requested_type():
+    fare = PricingEngine(FARES).price_ride(
+        ride(CarType.HATCHBACK, CarType.SEDAN, 10, surge=1.5, coupon=Coupon("FLAT5", FlatDiscount(5))))
+    # Hatchback 69 (the sedan would be 89), then x1.5 surge, then -5.
+    assert fare == FareBreakdown(base_fare=69, surge_multiplier=1.5, surged_fare=103.5, discount=5, total=98.5)

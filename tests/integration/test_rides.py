@@ -71,6 +71,14 @@ def test_ending_a_ride_counts_as_the_driver_being_seen(c, user, clock):
     assert c.rides.book(other.id, PICKUP, CarType.SEDAN).driver_id == driver.id
 
 
+def test_search_radius_is_inclusive_and_exact(c, user):
+    add_driver(c, CarType.SEDAN, km_away=5.001)
+    with pytest.raises(NoDriverAvailableError):
+        c.rides.book(user.id, PICKUP, CarType.SEDAN, radius_km=5)
+    inside = add_driver(c, CarType.SEDAN, km_away=4.999)
+    assert c.rides.book(user.id, PICKUP, CarType.SEDAN, radius_km=5).driver_id == inside.id
+
+
 def test_busy_driver_is_not_rebooked(c, user):
     add_driver(c, CarType.SEDAN)
     c.rides.book(user.id, PICKUP, CarType.SEDAN)
@@ -193,9 +201,10 @@ def test_ride_must_be_started_before_it_is_ended(c, user):
         c.rides.start(ride.id)
 
 
-def test_no_location_update_is_lost_or_billed_after_the_ride_ends(c, repos, user):
+def test_no_location_update_is_lost_or_billed_after_the_ride_ends(c, repos, user, clock):
     # A driver keeps sending updates while the ride is ended. Each update either lands before
     # the end (and is billed) or after it (and is ignored); none is half-applied or dropped.
+    # On Postgres this also exercises the lock order: an update and `end` must not deadlock.
     driver = add_driver(c, CarType.SEDAN, km_away=0)
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
     c.rides.start(ride.id)
@@ -207,8 +216,12 @@ def test_no_location_update_is_lost_or_billed_after_the_ride_ends(c, repos, user
             if stop.is_set():
                 return
             point = north_of(0.5 * (i % 4 + 1))
-            if repos.rides.modify_ongoing_for_driver(driver.id, lambda r: r.move_to(point)) is not None:
+
+            def bill_leg(r, point=point):
+                r.move_to(point)
                 applied.append(point)
+
+            repos.drivers.update_location(driver.id, point, clock.now, ride_change=bill_leg)
             first_update_done.set()
 
     t = threading.Thread(target=drive)
@@ -223,6 +236,50 @@ def test_no_location_update_is_lost_or_billed_after_the_ride_ends(c, repos, user
     assert ended.distance_km == pytest.approx(expected_km, abs=0.001)
     assert repos.rides.get(ride.id).distance_km == ended.distance_km
     assert ended.fare.total == pytest.approx(fare(CarType.SEDAN, ended.distance_km), abs=0.01)
+
+
+def test_location_update_is_all_or_nothing(c, repos, user, clock):
+    # Regression: moving the driver and billing the leg used to be two writes, so a crash
+    # between them moved the driver without billing the leg.
+    driver = add_driver(c, CarType.SEDAN, km_away=0)
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.rides.start(ride.id)
+
+    def crash_after_billing(r):
+        r.move_to(north_of(3))
+        raise RuntimeError("process died")
+
+    with pytest.raises(RuntimeError):
+        repos.drivers.update_location(driver.id, north_of(3), clock.now, ride_change=crash_after_billing)
+    assert c.drivers.get(driver.id).location == driver.location
+    assert repos.rides.get(ride.id).distance_km == 0
+
+
+def test_concurrent_ends_close_the_ride_exactly_once(c, repos, user):
+    driver = add_driver(c, CarType.SEDAN, km_away=0)
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.rides.start(ride.id)
+    ended, refused = [], []
+    barrier = threading.Barrier(2)
+
+    def end_at(km):
+        barrier.wait()
+        try:
+            ended.append(c.rides.end(ride.id, drop=north_of(km)))
+        except InvalidRideStateError as e:
+            refused.append(e)
+
+    threads = [threading.Thread(target=end_at, args=(km,)) for km in (3, 8)]   # different drops, different fares
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(ended) == 1 and len(refused) == 1
+    stored = repos.rides.get(ride.id)
+    assert (stored.distance_km, stored.fare) == (ended[0].distance_km, ended[0].fare)   # the winner's, not a mix
+    released = c.drivers.get(driver.id)
+    assert released.status == DriverStatus.AVAILABLE and released.location == ended[0].last_location
 
 
 def test_location_update_when_idle_does_not_touch_rides(c, user):

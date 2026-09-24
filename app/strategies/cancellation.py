@@ -9,6 +9,13 @@ class CancellationPolicy(ABC):
     def fee(self, ride: Ride, cancelled_at: datetime) -> float: ...
 
 
+class FreeCancellationPolicy(CancellationPolicy):
+    """Cancelling before pickup never costs anything."""
+
+    def fee(self, ride: Ride, cancelled_at: datetime) -> float:
+        return 0.0
+
+
 class GracePeriodCancellationPolicy(CancellationPolicy):
     """Free within the grace window after booking, flat fee afterwards (only a booked ride can be cancelled)."""
 

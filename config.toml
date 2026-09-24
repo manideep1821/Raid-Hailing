@@ -33,6 +33,7 @@ tiers = [
 offline_after_minutes = 30
 
 [cancellation]
+policy = "grace_period"     # grace_period | free
 grace_period_minutes = 2   # free to cancel within this window after booking
 fee = 25
 

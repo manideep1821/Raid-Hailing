@@ -5,10 +5,11 @@ import tomllib
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from app.domain.exceptions import ValidationError
 from app.domain.models import CarType
+from app.strategies.cancellation import CancellationPolicy, FreeCancellationPolicy, GracePeriodCancellationPolicy
 from app.strategies.matching import MATCHING_STRATEGIES
 from app.strategies.pricing import FareStrategy, TieredFareStrategy
 
@@ -34,8 +35,7 @@ class AppConfig:
     default_radius_km: float
     default_matching_strategy: str
     driver_timeout: timedelta
-    cancellation_grace: timedelta
-    cancellation_fee: float
+    cancellation_policy: CancellationPolicy
     surge: SurgeConfig
     database_url: str
     db_pool_size: int
@@ -96,6 +96,20 @@ def _check_no_upgrade_cycle(upgrades: Dict[CarType, CarType]) -> None:
             _check(path[-1] not in path[:-1], f"upgrade cycle: {' -> '.join(t.value for t in path)}")
 
 
+def _grace_period_policy(spec: Dict[str, Any]) -> CancellationPolicy:
+    _check(spec["grace_period_minutes"] >= 0, "cancellation.grace_period_minutes must be >= 0")
+    _check(spec["fee"] >= 0, "cancellation.fee must be >= 0")
+    return GracePeriodCancellationPolicy(timedelta(minutes=spec["grace_period_minutes"]), float(spec["fee"]))
+
+
+# `[cancellation] policy` -> builder taking that section. A new policy is a class in
+# app/strategies/cancellation.py plus an entry here.
+_CANCELLATION_POLICIES: Dict[str, Callable[[Dict[str, Any]], CancellationPolicy]] = {
+    "grace_period": _grace_period_policy,
+    "free": lambda spec: FreeCancellationPolicy(),
+}
+
+
 def _parse(raw: Dict[str, Any]) -> AppConfig:
     booking, cancellation, surge, db = raw["booking"], raw["cancellation"], raw["surge"], raw["database"]
 
@@ -112,8 +126,9 @@ def _parse(raw: Dict[str, Any]) -> AppConfig:
            f"unknown matching strategy '{strategy}' (known: {', '.join(MATCHING_STRATEGIES)})")
 
     _check(raw["drivers"]["offline_after_minutes"] > 0, "drivers.offline_after_minutes must be > 0")
-    _check(cancellation["grace_period_minutes"] >= 0, "cancellation.grace_period_minutes must be >= 0")
-    _check(cancellation["fee"] >= 0, "cancellation.fee must be >= 0")
+    policy = cancellation["policy"]
+    _check(policy in _CANCELLATION_POLICIES,
+           f"unknown cancellation policy '{policy}' (known: {', '.join(_CANCELLATION_POLICIES)})")
 
     _check(isinstance(surge["enabled"], bool), "surge.enabled must be true or false")
     _check(surge["area_radius_km"] > 0, "surge.area_radius_km must be > 0")
@@ -128,8 +143,7 @@ def _parse(raw: Dict[str, Any]) -> AppConfig:
         default_radius_km=float(booking["default_radius_km"]),
         default_matching_strategy=strategy,
         driver_timeout=timedelta(minutes=raw["drivers"]["offline_after_minutes"]),
-        cancellation_grace=timedelta(minutes=cancellation["grace_period_minutes"]),
-        cancellation_fee=float(cancellation["fee"]),
+        cancellation_policy=_CANCELLATION_POLICIES[policy](cancellation),
         surge=SurgeConfig(surge["enabled"], float(surge["area_radius_km"]),
                           timedelta(minutes=surge["window_minutes"]), float(surge["cap"])),
         database_url=os.environ.get("DATABASE_URL") or db["url"],

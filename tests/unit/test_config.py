@@ -8,6 +8,7 @@ from app.config import DEFAULT_CONFIG_PATH, ConfigError, load_config, parse_conf
 from app.container import build_container
 from app.domain.exceptions import NoDriverAvailableError
 from app.domain.models import CarType
+from app.strategies.cancellation import GracePeriodCancellationPolicy
 from app.strategies.matching import HighestRatedDriverStrategy
 from tests.support import PICKUP, TEST_CONFIG_PATH, north_of
 
@@ -31,8 +32,8 @@ def test_values_are_mapped():
     assert config.default_matching_strategy == "nearest"
     assert config.driver_timeout == timedelta(minutes=60)
     assert config.upgrade_path == {CarType.HATCHBACK: CarType.SEDAN}
-    assert config.cancellation_grace == timedelta(minutes=2)
-    assert config.cancellation_fee == 25
+    assert isinstance(config.cancellation_policy, GracePeriodCancellationPolicy)
+    assert (config.cancellation_policy.grace, config.cancellation_policy.fee_amount) == (timedelta(minutes=2), 25)
     assert config.fare_strategies[CarType.HATCHBACK].base_fare(10) == 69
     assert config.surge.enabled is False
     assert config.surge.window == timedelta(minutes=15)
@@ -74,6 +75,7 @@ def test_missing_or_malformed_file(tmp_path):
     (lambda r: r["booking"]["upgrades"].update(sedan="hatchback"), "upgrade cycle: hatchback -> sedan -> hatchback"),
     (lambda r: r["booking"]["upgrades"].update(hatchback="limo"), "unknown car type 'limo'"),
     (lambda r: r["cancellation"].update(fee=-1), "cancellation.fee"),
+    (lambda r: r["cancellation"].update(policy="refund"), "unknown cancellation policy 'refund'"),
     (lambda r: r["drivers"].update(offline_after_minutes=0), "drivers.offline_after_minutes"),
     (lambda r: r["cancellation"].pop("grace_period_minutes"), "missing key 'grace_period_minutes'"),
     (lambda r: r["surge"].update(cap=0.5), "surge.cap"),
@@ -145,3 +147,12 @@ def test_prices_from_config():
     c.rides.start(ride.id)
     ended = c.rides.end(ride.id, drop=north_of(20))
     assert ended.fare.total == pytest.approx(20, abs=0.05)
+
+
+def test_free_cancellation_policy_from_config():
+    now = [datetime(2026, 1, 1, 10, 0)]
+    c = container_with(lambda r: r["cancellation"].update(policy="free"), clock=lambda: now[0])
+    user, _ = setup(c, km_north=1)
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    now[0] += timedelta(hours=1)                                   # long past any grace period
+    assert c.rides.cancel(ride.id).cancellation_fee == 0

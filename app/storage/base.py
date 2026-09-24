@@ -22,6 +22,9 @@ class UserRepository(ABC):
     def get(self, user_id: str) -> User: ...
 
 
+RideChange = Callable[[Ride], None]
+
+
 class DriverRepository(ABC):
     @abstractmethod
     def add(self, driver: Driver) -> Driver:
@@ -37,10 +40,10 @@ class DriverRepository(ABC):
         all car types when `car_type` is None."""
 
     @abstractmethod
-    def update_location(self, driver_id: str, location: Location, seen_at: datetime) -> Driver: ...
-
-
-RideChange = Callable[[Ride], None]
+    def update_location(self, driver_id: str, location: Location, seen_at: datetime,
+                        ride_change: Optional[RideChange] = None) -> Driver:
+        """Move the driver and record them as seen. In the same transaction, apply `ride_change`
+        to their ONGOING ride (rider on board), if there is one: both happen, or neither."""
 
 
 class RideRepository(ABC):
@@ -72,10 +75,6 @@ class RideRepository(ABC):
         If the change closes the ride, the same transaction releases the driver; a completed ride
         also moves the driver to where it ended, unless the driver has since reported a newer
         location."""
-
-    @abstractmethod
-    def modify_ongoing_for_driver(self, driver_id: str, change: RideChange) -> Optional[Ride]:
-        """`modify` the driver's ONGOING ride (rider on board); None if there isn't one."""
 
 
 class CouponRepository(ABC):
