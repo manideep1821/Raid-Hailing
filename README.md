@@ -5,7 +5,7 @@
 ```bash
 docker compose up -d --wait            # Postgres 16 on localhost:5433 (dbs: rides, rides_test)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q                    # 138 tests; Postgres cases skip if the DB is down
+.venv/bin/pytest -q                    # 160 tests; Postgres cases skip if the DB is down
 .venv/bin/python -m app.demo           # scripted walkthrough of every edge case, in memory
 
 alias rides=".venv/bin/python -m app.cli"
@@ -70,10 +70,12 @@ The tests use their own pinned [`tests/config.test.toml`](tests/config.test.toml
 - **Ride lifecycle**: `booked` (driver assigned, heading to the pickup) → `ongoing` (`start`: rider on board) → `completed`, or `booked` → `cancelled`. Ride history shows booked and ongoing rides together under "ongoing".
 - **Distance** is the sum of the legs along the ride's route: the pickup point, every `update-location` sent after `start`, and the optional drop point. It is kept as a running total (plus the last point), not as a stored route. The driver's approach to the pickup is not billed. Distances are straight-line (haversine), not road distances.
 - **Drivers go offline by silence**: a driver with no location update for `drivers.offline_after_minutes` isn't matched or counted as surge supply. Any update (and ending a ride) counts as a heartbeat. The shipped 30 minutes suits manual CLI use; an app sending heartbeats every few seconds would use about a minute.
-- **Coupons** are validated when the ride is **booked** (the spec says "when starting a ride") and applied to the final fare. The coupon is snapshotted onto the ride, so deleting it mid-ride doesn't change what the rider was promised. Discounts are flat or percentage with an optional cap, never below ₹0, and applied after surge. Codes are case-insensitive, and coupons are unlimited-use with no expiry.
+- **Coupons** are validated when the ride is **booked**, not at `start` (the spec says "when starting a ride"), so the rider knows before a driver is committed whether the code works; it is applied to the final fare. The coupon is snapshotted onto the ride, so deleting it mid-ride doesn't change what the rider was promised. Discounts are flat or percentage with an optional cap, never below ₹0, and applied after surge. Codes are case-insensitive, and coupons are unlimited-use with no expiry.
 - A user can have at most one ongoing ride. The shipped default search radius is 5 km.
+- A phone number registers at most one user and at most one driver (one person can be both). Coordinates must be valid: latitude within ±90, longitude within ±180.
+- **Driver ratings** are set at registration and never change (there is no rating step after a ride), so "highest-rated" matching ranks on that fixed value.
 - Cancellation is only possible before pickup. It is free within 2 minutes of booking and ₹25 after that (shipped config). A cancelled ride leaves the driver at their last reported location.
-- **Surge** is computed once, at booking, and locked onto the ride like the coupon. Demand = rides booked within 2 km of the pickup in the last 15 minutes (cancelled ones included, as they were requests), plus this one; supply = available drivers of any type within 2 km. Multiplier = demand / supply within [1, cap]; the cap applies when there is no supply.
+- **Surge** is computed once, at booking, and locked onto the ride like the coupon. Demand = this rider plus the *distinct other* riders who booked within 2 km of the pickup in the last 15 minutes; supply = online available drivers of any type within 2 km, counted as at least 1. Multiplier = demand / supply within [1, cap]. So a rider with no competition is never surged (even when the only driver is outside the 2 km area but inside the booking radius), and cancelling and rebooking can't raise your own price.
 - No auth, payments, driver acceptance step, or explicit driver on/offline toggle.
 
 ## Key design decisions & trade-offs
@@ -84,11 +86,12 @@ The tests use their own pinned [`tests/config.test.toml`](tests/config.test.toml
 - **The fare is a breakdown** (base, surge, discount, total) stored on the ride, so the receipt explains itself. The rule "an upgrade is billed at the requested type" lives in `PricingEngine.price_ride`, next to the rest of the pricing.
 - **Config has no code fallbacks.** Services receive every value through their constructors, and `config.toml` is the single source of truth. Tests pin their own config file.
 - **Concurrency is enforced in storage, not in an app lock.** A CLI runs each command in a new process, so a `threading.Lock` would protect nothing. Instead:
-  - booking claims a driver with `UPDATE drivers SET status='on_ride' WHERE id=? AND status='available'`. Whoever loses the claim moves on to the next ranked driver;
+  - **a driver's status follows their ride, in the same transaction.** `RideRepository.create` claims the driver (`UPDATE drivers SET status='on_ride' WHERE id=? AND status='available'`) and inserts the ride together. Whoever loses the claim moves on to the next ranked driver, and if the insert fails the claim rolls back with it. Closing a ride releases the driver in the ride's transaction too. A crash at any point therefore can't leave a driver stuck `on_ride` with no ride;
   - every change to a ride (start, a location update's leg, end, cancel) goes through `RideRepository.modify(ride_id, change)`: a `SELECT … FOR UPDATE` row lock, the change, and the write, in one transaction. The service passes the change as a function, so the rules (status checks, pricing) stay in the service while the storage decides how to make it atomic. So a ride can't be started or closed twice, and a location update lands either before `end` (and is billed) or after it (and is ignored), never lost in between;
+  - a completed ride moves the driver to its drop point only if the driver hasn't reported a newer location since, so ending a ride never overwrites a fresher position;
   - partial unique indexes guarantee one active (booked or ongoing) ride per user and per driver.
 
-  The in-memory repository implements the same contract with locks, and hands out **copies** so it behaves like a database. The ride test suite runs against both backends, including a 20-thread race for 3 drivers and location updates racing `end`.
+  The in-memory repository implements the same contract with one lock shared by drivers and rides (its version of a transaction), and hands out **copies** so it behaves like a database. The ride test suite runs against both backends, including a 20-thread race for 3 drivers, location updates racing `end`, and a change that fails halfway.
 - **Running distance, not a stored route.** Each location update adds one leg to `distance_km` and moves `last_location`: constant work per update, no growing column. The trade-off is that the route itself isn't kept; see Scaling.
 - **Surge reads live state** from the repositories rather than keeping its own, so it works across CLI processes.
 - Money is stored as `float`, rounded to 2 decimal places at the pricing boundary.

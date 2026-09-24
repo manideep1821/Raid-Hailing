@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Optional
 
 from app.discounts import Discount
+from app.exceptions import ValidationError
 
 EARTH_RADIUS_KM = 6371.0
 
@@ -13,6 +14,11 @@ EARTH_RADIUS_KM = 6371.0
 class Location:
     lat: float
     lng: float
+
+    def __post_init__(self):
+        if not (-90 <= self.lat <= 90 and -180 <= self.lng <= 180):
+            raise ValidationError(f"invalid coordinates ({self.lat}, {self.lng}): "
+                                  "latitude must be within ±90 and longitude within ±180")
 
     def distance_km(self, other: "Location") -> float:
         """Great-circle (haversine) distance."""

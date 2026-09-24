@@ -1,3 +1,4 @@
+import itertools
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ from app.surge import DemandSupplySurge
 PICKUP = Location(12.9716, 77.5946)
 KM_PER_DEG_LAT = 111.19492664455873
 CONFIG = load_config(Path(__file__).with_name("config.test.toml"))
+PHONES = itertools.count(9000000000)  # phone numbers are unique per user and per driver
 
 
 def north_of(km: float) -> Location:
@@ -43,41 +45,51 @@ def surge(repos, clock):
 
 
 def add_drivers(c, n, km=0.5, car_type=CarType.SEDAN):
-    return [c.drivers.register(f"D{i}", "911", car_type, north_of(km), 4.5) for i in range(n)]
+    return [c.drivers.register(f"D{i}", str(next(PHONES)), car_type, north_of(km), 4.5) for i in range(n)]
 
 
 def book(c, n):
     rides = []
     for i in range(n):
-        user = c.users.register(f"u{i}", "900")
+        user = c.users.register(f"u{i}", str(next(PHONES)))
         rides.append(c.rides.book(user.id, PICKUP, CarType.SEDAN))
     return rides
 
 
+NEW_RIDER = "U-new"   # someone asking for a price who hasn't booked yet
+
+
 def test_no_recent_demand_means_no_surge(c, surge):
     add_drivers(c, 3)
-    assert surge.multiplier(PICKUP) == 1.0
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 1.0
 
 
 def test_demand_over_supply_sets_the_multiplier(c, surge):
     add_drivers(c, 4)
-    book(c, 2)                                   # 2 recent bookings + this request = 3; 2 drivers left
-    assert surge.multiplier(PICKUP) == 1.5
+    book(c, 2)                                   # 2 recent riders + this one = 3; 2 drivers left
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 1.5
 
 
-def test_multiplier_is_capped_and_no_supply_means_cap(c, surge):
+def test_multiplier_is_capped(c, surge):
     add_drivers(c, 3)
     book(c, 2)                                   # demand 3, supply 1 -> 3.0, capped at 2.0
-    assert surge.multiplier(PICKUP) == 2.0
-    book(c, 1)                                   # supply 0
-    assert surge.multiplier(PICKUP) == 2.0
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 2.0
+    book(c, 1)                                   # demand 4, supply 0 (counted as 1) -> capped
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 2.0
+
+
+def test_lone_rider_is_never_surged_even_with_no_driver_in_the_area(c, surge):
+    # Regression: the only driver is 3 km away, outside the 2 km surge area but inside the 5 km
+    # booking radius. Zero supply used to mean the cap; nobody is competing, so it's 1.0.
+    add_drivers(c, 1, km=3)
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 1.0
 
 
 def test_supply_counts_every_car_type_in_the_area(c, surge):
     add_drivers(c, 2, car_type=CarType.HATCHBACK)
     add_drivers(c, 1, car_type=CarType.SEDAN)
     book(c, 1)                                   # demand 2, supply 2
-    assert surge.multiplier(PICKUP) == 1.0
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 1.0
 
 
 def test_offline_drivers_are_not_supply(c, surge, clock):
@@ -86,17 +98,27 @@ def test_offline_drivers_are_not_supply(c, surge, clock):
     for d in drivers[:2]:                                      # the third goes quiet: offline
         c.drivers.update_location(d.id, north_of(0.5))
     book(c, 1)
-    # demand 2 (1 recent + this); supply is the 1 online driver left. Counting the offline
-    # driver would make supply 2 and the multiplier 1.0.
-    assert surge.multiplier(PICKUP) == 2.0
+    # demand 2 (1 recent rider + this one); supply is the 1 online driver left. Counting the
+    # offline driver would make supply 2 and the multiplier 1.0.
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 2.0
 
 
 def test_old_or_far_bookings_are_not_demand(c, surge, clock):
     add_drivers(c, 3)
     book(c, 2)
+    # 10 km away there are no drivers (supply counted as 1): counting these 2 riders would cap it.
+    assert surge.multiplier(north_of(10), NEW_RIDER) == 1.0
     clock.now += timedelta(minutes=16)           # both bookings fall out of the window
-    assert surge.multiplier(PICKUP) == 1.0
-    assert surge.multiplier(north_of(10)) == 2.0  # 10 km away: no drivers there, so cap
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 1.0
+
+
+def test_demand_counts_riders_not_bookings(c, surge):
+    add_drivers(c, 3)
+    user = c.users.register("Asha", str(next(PHONES)))
+    for _ in range(3):                           # the same rider books and cancels three times
+        c.rides.cancel(c.rides.book(user.id, PICKUP, CarType.SEDAN).id)
+    assert surge.multiplier(PICKUP, user.id) == 1.0       # their own bookings don't count
+    assert surge.multiplier(PICKUP, NEW_RIDER) == 1.0     # demand 2 (Asha + new), supply 3
 
 
 def test_booking_locks_the_surge_onto_the_ride_and_the_fare(repos, clock):

@@ -1,9 +1,10 @@
 """Storage contracts plus an in-memory implementation.
 
 State transitions that must be race-free are repository operations, so each backend enforces
-them atomically in its own way: a driver is claimed with a compare-and-set, and a ride is
-changed by a locked read-modify-write (`modify`). The in-memory store hands out copies so it
-behaves like a real database.
+them atomically in its own way. A driver's status follows their ride: creating a ride claims
+the driver and closing it releases them, in the same transaction, so a crash can never leave a
+driver on a ride that doesn't exist. The in-memory store hands out copies and shares one lock
+between drivers and rides, so it behaves like a real database.
 """
 import copy
 import threading
@@ -18,7 +19,8 @@ from app.models import CarType, Coupon, Driver, DriverStatus, Location, Ride, Ri
 
 class UserRepository(ABC):
     @abstractmethod
-    def add(self, user: User) -> User: ...
+    def add(self, user: User) -> User:
+        """ValidationError if the phone number is already registered."""
 
     @abstractmethod
     def get(self, user_id: str) -> User: ...
@@ -26,7 +28,8 @@ class UserRepository(ABC):
 
 class DriverRepository(ABC):
     @abstractmethod
-    def add(self, driver: Driver) -> Driver: ...
+    def add(self, driver: Driver) -> Driver:
+        """ValidationError if the phone number is already registered."""
 
     @abstractmethod
     def get(self, driver_id: str) -> Driver: ...
@@ -40,22 +43,16 @@ class DriverRepository(ABC):
     @abstractmethod
     def update_location(self, driver_id: str, location: Location, seen_at: datetime) -> Driver: ...
 
-    @abstractmethod
-    def try_claim(self, driver_id: str) -> bool:
-        """Atomically AVAILABLE -> ON_RIDE. False if someone else got there first."""
-
-    @abstractmethod
-    def release(self, driver_id: str) -> None:
-        """Mark AVAILABLE."""
-
 
 RideChange = Callable[[Ride], None]
 
 
 class RideRepository(ABC):
     @abstractmethod
-    def create(self, ride: Ride) -> Ride:
-        """Insert a booked ride; InvalidRideStateError if the user already has an active one."""
+    def create(self, ride: Ride) -> bool:
+        """Atomically claim the ride's driver (AVAILABLE -> ON_RIDE) and insert the booked ride.
+        False if the driver was no longer available. InvalidRideStateError, with nothing written,
+        if the user already has an active ride."""
 
     @abstractmethod
     def get(self, ride_id: str) -> Ride: ...
@@ -67,13 +64,18 @@ class RideRepository(ABC):
     def for_driver(self, driver_id: str) -> List[Ride]: ...
 
     @abstractmethod
-    def count_booked_near(self, pickup: Location, radius_km: float, since: datetime) -> int:
-        """Rides booked at or after `since` whose pickup is within the radius."""
+    def count_riders_near(self, pickup: Location, radius_km: float, since: datetime, excluding_user_id: str) -> int:
+        """Distinct users, other than `excluding_user_id`, who booked a ride at or after `since`
+        with a pickup within the radius."""
 
     @abstractmethod
     def modify(self, ride_id: str, change: RideChange) -> Ride:
         """Lock the ride, apply `change` to it and save it, all or nothing: no other change to the
-        ride can interleave, and if `change` raises nothing is saved. Returns the saved ride."""
+        ride can interleave, and if `change` raises nothing is saved. Returns the saved ride.
+
+        If the change closes the ride, the same transaction releases the driver; a completed ride
+        also moves the driver to where it ended, unless the driver has since reported a newer
+        location."""
 
     @abstractmethod
     def modify_ongoing_for_driver(self, driver_id: str, change: RideChange) -> Optional[Ride]:
@@ -106,13 +108,21 @@ def _get(items: Dict, key: str, name: str):
     return copy.deepcopy(items[key])
 
 
+def _check_phone_free(items: Dict, phone: str) -> None:
+    if any(item.phone == phone for item in items.values()):
+        raise ValidationError(f"phone {phone} is already registered")
+
+
 class InMemoryUserRepository(UserRepository):
     def __init__(self):
         self._items: Dict[str, User] = {}
+        self._lock = threading.Lock()
 
     def add(self, user: User) -> User:
-        self._items[user.id] = copy.deepcopy(user)
-        return user
+        with self._lock:
+            _check_phone_free(self._items, user.phone)
+            self._items[user.id] = copy.deepcopy(user)
+            return user
 
     def get(self, user_id: str) -> User:
         return _get(self._items, user_id, "user")
@@ -124,8 +134,10 @@ class InMemoryDriverRepository(DriverRepository):
         self._lock = threading.Lock()
 
     def add(self, driver: Driver) -> Driver:
-        self._items[driver.id] = copy.deepcopy(driver)
-        return driver
+        with self._lock:
+            _check_phone_free(self._items, driver.phone)
+            self._items[driver.id] = copy.deepcopy(driver)
+            return driver
 
     def get(self, driver_id: str) -> Driver:
         return _get(self._items, driver_id, "driver")
@@ -147,30 +159,25 @@ class InMemoryDriverRepository(DriverRepository):
             self._items[driver_id].last_seen_at = seen_at
             return copy.deepcopy(self._items[driver_id])
 
-    def try_claim(self, driver_id: str) -> bool:
-        with self._lock:
-            driver = self._items.get(driver_id)
-            if driver is None or driver.status != DriverStatus.AVAILABLE:
-                return False
-            driver.status = DriverStatus.ON_RIDE
-            return True
-
-    def release(self, driver_id: str) -> None:
-        with self._lock:
-            self._items[driver_id].status = DriverStatus.AVAILABLE
-
 
 class InMemoryRideRepository(RideRepository):
-    def __init__(self):
+    def __init__(self, drivers: InMemoryDriverRepository):
         self._items: Dict[str, Ride] = {}
-        self._lock = threading.Lock()
+        # Rides change their driver's status, so both stores share one lock: the in-memory
+        # equivalent of a transaction spanning the two tables.
+        self._drivers = drivers._items
+        self._lock = drivers._lock
 
-    def create(self, ride: Ride) -> Ride:
+    def create(self, ride: Ride) -> bool:
         with self._lock:
             if any(r.user_id == ride.user_id and r.is_active for r in self._items.values()):
                 raise InvalidRideStateError("user already has an active ride")
+            driver = self._drivers[ride.driver_id]
+            if driver.status != DriverStatus.AVAILABLE:
+                return False
+            driver.status = DriverStatus.ON_RIDE
             self._items[ride.id] = copy.deepcopy(ride)
-            return ride
+            return True
 
     def get(self, ride_id: str) -> Ride:
         return _get(self._items, ride_id, "ride")
@@ -181,9 +188,10 @@ class InMemoryRideRepository(RideRepository):
     def for_driver(self, driver_id: str) -> List[Ride]:
         return [copy.deepcopy(r) for r in list(self._items.values()) if r.driver_id == driver_id]
 
-    def count_booked_near(self, pickup: Location, radius_km: float, since: datetime) -> int:
-        return sum(1 for r in list(self._items.values())
-                   if r.booked_at >= since and r.pickup.distance_km(pickup) <= radius_km)
+    def count_riders_near(self, pickup: Location, radius_km: float, since: datetime, excluding_user_id: str) -> int:
+        return len({r.user_id for r in list(self._items.values())
+                    if r.booked_at >= since and r.user_id != excluding_user_id
+                    and r.pickup.distance_km(pickup) <= radius_km})
 
     def modify(self, ride_id: str, change: RideChange) -> Ride:
         with self._lock:
@@ -198,7 +206,14 @@ class InMemoryRideRepository(RideRepository):
 
     def _apply(self, ride: Ride, change: RideChange) -> Ride:
         """`ride` is a copy, so if `change` raises, storage is untouched. Caller holds the lock."""
+        was_active = ride.is_active
         change(ride)
+        if was_active and not ride.is_active:
+            driver = self._drivers[ride.driver_id]
+            driver.status = DriverStatus.AVAILABLE
+            if ride.status == RideStatus.COMPLETED and driver.last_seen_at <= ride.ended_at:
+                driver.location = ride.last_location
+                driver.last_seen_at = ride.ended_at
         self._items[ride.id] = copy.deepcopy(ride)
         return ride
 
@@ -225,5 +240,6 @@ class InMemoryCouponRepository(CouponRepository):
 
 
 def in_memory_repositories() -> Repositories:
-    return Repositories(InMemoryUserRepository(), InMemoryDriverRepository(),
-                        InMemoryRideRepository(), InMemoryCouponRepository())
+    drivers = InMemoryDriverRepository()
+    return Repositories(InMemoryUserRepository(), drivers, InMemoryRideRepository(drivers),
+                        InMemoryCouponRepository())

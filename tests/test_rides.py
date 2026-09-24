@@ -11,12 +11,13 @@ from app.exceptions import (InvalidCouponError, InvalidRideStateError, NoDriverA
                             ValidationError)
 from app.discounts import FlatDiscount, PercentageDiscount
 from app.matching import HighestRatedDriverStrategy
-from app.models import CarType, DriverStatus, Location, RideStatus
+from app.models import CarType, DriverStatus, Location, Ride, RideStatus
 from app.services import upgrade_chain
 
 PICKUP = Location(12.9716, 77.5946)
 KM_PER_DEG_LAT = 111.19492664455873
 CONFIG = load_config(Path(__file__).with_name("config.test.toml"))
+PHONES = itertools.count(9100000000)  # phone numbers are unique per driver
 
 
 def north_of(loc: Location, km: float) -> Location:
@@ -51,7 +52,7 @@ def user(c):
 
 
 def add_driver(c, car_type, km_away=1.0, rating=4.5, name="D"):
-    return c.drivers.register(name, "9111111111", car_type, north_of(PICKUP, km_away), rating)
+    return c.drivers.register(name, str(next(PHONES)), car_type, north_of(PICKUP, km_away), rating)
 
 
 def complete(c, ride_id, drop=None):
@@ -126,6 +127,21 @@ def test_highest_rated_strategy_is_switchable_per_booking(c, user):
 def test_unknown_user_rejected(c):
     with pytest.raises(NotFoundError):
         c.rides.book("U-missing", PICKUP, CarType.SEDAN)
+
+
+@pytest.mark.parametrize("lat, lng", [(91, 0), (-90.5, 0), (0, 180.1), (200, 77)])
+def test_invalid_coordinates_rejected(lat, lng):
+    with pytest.raises(ValidationError, match="invalid coordinates"):
+        Location(lat, lng)
+
+
+def test_phone_number_is_registered_once_per_user_and_per_driver(c, user):
+    with pytest.raises(ValidationError, match="already registered"):
+        c.users.register("Asha again", user.phone)
+    driver = add_driver(c, CarType.SEDAN)
+    with pytest.raises(ValidationError, match="already registered"):
+        c.drivers.register("Sam again", driver.phone, CarType.SEDAN, PICKUP)
+    assert c.drivers.register("Asha drives too", user.phone, CarType.SEDAN, PICKUP)   # separate roles
 
 
 def test_invalid_radius_rejected(c, user):
@@ -375,6 +391,45 @@ def test_cannot_cancel_after_pickup(c, user):
     with pytest.raises(InvalidRideStateError, match="not booked"):
         c.rides.cancel(ride.id)
     assert c.drivers.get(driver.id).status == DriverStatus.ON_RIDE
+
+
+# --- atomicity: a ride and its driver change together, or not at all -------------------
+
+def test_failed_ride_insert_does_not_leave_the_driver_claimed(c, repos, user):
+    add_driver(c, CarType.SEDAN)
+    c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    free = add_driver(c, CarType.SEDAN)
+    second = Ride("R-dup", user.id, free.id, CarType.SEDAN, CarType.SEDAN, PICKUP, PICKUP)
+    with pytest.raises(InvalidRideStateError):      # the user already has an active ride
+        repos.rides.create(second)
+    assert c.drivers.get(free.id).status == DriverStatus.AVAILABLE
+
+
+def test_failed_ride_change_leaves_ride_and_driver_untouched(c, repos, user):
+    driver = add_driver(c, CarType.SEDAN)
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.rides.start(ride.id)
+
+    def crash_while_ending(r):
+        r.status = RideStatus.COMPLETED
+        raise RuntimeError("process died")
+
+    with pytest.raises(RuntimeError):
+        repos.rides.modify(ride.id, crash_while_ending)
+    assert c.rides.history_for_user(user.id)["ongoing"][0].status == RideStatus.ONGOING
+    assert c.drivers.get(driver.id).status == DriverStatus.ON_RIDE
+
+
+def test_end_keeps_a_driver_location_newer_than_the_ride(c, repos, user, clock):
+    # Regression: end used to move the driver to the drop point after closing the ride, which
+    # overwrote any location the driver had reported in between.
+    driver = add_driver(c, CarType.SEDAN, km_away=0)
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.rides.start(ride.id)
+    newer = north_of(PICKUP, 7)
+    repos.drivers.update_location(driver.id, newer, clock.now + timedelta(seconds=1))
+    c.rides.end(ride.id, drop=north_of(PICKUP, 5))
+    assert c.drivers.get(driver.id).location == newer
 
 
 # --- concurrency ------------------------------------------------------------------

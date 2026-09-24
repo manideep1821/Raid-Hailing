@@ -1,6 +1,7 @@
 """Postgres-backed repositories. The atomic guarantees of the repository contract come from
-the database, not application locks: conditional UPDATEs (claiming a driver), row locks
-inside a transaction (`modify` on a ride) and partial unique indexes (one active ride each)."""
+the database, not application locks: a conditional UPDATE claims a driver, a ride and its
+driver change in one transaction (with the ride row locked by `modify`), and partial unique
+indexes allow one active ride per user and per driver."""
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ from app.repository import (CouponRepository, DriverRepository, Repositories, Ri
                             UserRepository)
 
 SCHEMA = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SchemaOutOfDateError(Exception):
@@ -44,7 +45,10 @@ class _Base:
 
 class PostgresUserRepository(_Base, UserRepository):
     def add(self, user: User) -> User:
-        self._exec("INSERT INTO users (id, name, phone) VALUES (%s, %s, %s)", (user.id, user.name, user.phone))
+        try:
+            self._exec("INSERT INTO users (id, name, phone) VALUES (%s, %s, %s)", (user.id, user.name, user.phone))
+        except UniqueViolation:
+            raise ValidationError(f"phone {user.phone} is already registered")
         return user
 
     def get(self, user_id: str) -> User:
@@ -62,11 +66,14 @@ def _driver(row: dict) -> Driver:
 
 class PostgresDriverRepository(_Base, DriverRepository):
     def add(self, driver: Driver) -> Driver:
-        self._exec(
-            "INSERT INTO drivers (id, name, phone, car_type, lat, lng, rating, status, last_seen_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (driver.id, driver.name, driver.phone, driver.car_type.value, driver.location.lat,
-             driver.location.lng, driver.rating, driver.status.value, driver.last_seen_at))
+        try:
+            self._exec(
+                "INSERT INTO drivers (id, name, phone, car_type, lat, lng, rating, status, last_seen_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (driver.id, driver.name, driver.phone, driver.car_type.value, driver.location.lat,
+                 driver.location.lng, driver.rating, driver.status.value, driver.last_seen_at))
+        except UniqueViolation:
+            raise ValidationError(f"phone {driver.phone} is already registered")
         return driver
 
     def get(self, driver_id: str) -> Driver:
@@ -91,13 +98,6 @@ class PostgresDriverRepository(_Base, DriverRepository):
         if row is None:
             raise NotFoundError(f"driver '{driver_id}' not found")
         return _driver(row)
-
-    def try_claim(self, driver_id: str) -> bool:
-        return self._exec("UPDATE drivers SET status = 'on_ride' WHERE id = %s AND status = 'available'",
-                          (driver_id,)) == 1
-
-    def release(self, driver_id: str) -> None:
-        self._exec("UPDATE drivers SET status = 'available' WHERE id = %s", (driver_id,))
 
 
 def _coupon_json(coupon: Optional[Coupon]):
@@ -127,19 +127,24 @@ def _ride(row: dict) -> Ride:
 
 
 class PostgresRideRepository(_Base, RideRepository):
-    def create(self, ride: Ride) -> Ride:
+    def create(self, ride: Ride) -> bool:
         try:
-            self._exec(
-                "INSERT INTO rides (id, user_id, driver_id, requested_car_type, assigned_car_type, "
-                "pickup_lat, pickup_lng, last_lat, last_lng, distance_km, coupon, surge_multiplier, status, "
-                "booked_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (ride.id, ride.user_id, ride.driver_id, ride.requested_car_type.value,
-                 ride.assigned_car_type.value, ride.pickup.lat, ride.pickup.lng, ride.last_location.lat,
-                 ride.last_location.lng, ride.distance_km, _coupon_json(ride.coupon), ride.surge_multiplier,
-                 ride.status.value, ride.booked_at))
-        except UniqueViolation:
+            with self.pool.connection() as conn, conn.transaction():
+                claimed = conn.execute("UPDATE drivers SET status = 'on_ride' WHERE id = %s AND status = 'available'",
+                                       (ride.driver_id,)).rowcount == 1
+                if not claimed:
+                    return False
+                conn.execute(
+                    "INSERT INTO rides (id, user_id, driver_id, requested_car_type, assigned_car_type, "
+                    "pickup_lat, pickup_lng, last_lat, last_lng, distance_km, coupon, surge_multiplier, status, "
+                    "booked_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (ride.id, ride.user_id, ride.driver_id, ride.requested_car_type.value,
+                     ride.assigned_car_type.value, ride.pickup.lat, ride.pickup.lng, ride.last_location.lat,
+                     ride.last_location.lng, ride.distance_km, _coupon_json(ride.coupon), ride.surge_multiplier,
+                     ride.status.value, ride.booked_at))
+        except UniqueViolation:  # the transaction rolled back, releasing the claim too
             raise InvalidRideStateError("user already has an active ride")
-        return ride
+        return True
 
     def get(self, ride_id: str) -> Ride:
         row = self._one("SELECT * FROM rides WHERE id = %s", (ride_id,))
@@ -153,9 +158,11 @@ class PostgresRideRepository(_Base, RideRepository):
     def for_driver(self, driver_id: str) -> List[Ride]:
         return [_ride(r) for r in self._all("SELECT * FROM rides WHERE driver_id = %s", (driver_id,))]
 
-    def count_booked_near(self, pickup: Location, radius_km: float, since: datetime) -> int:
-        rows = self._all("SELECT pickup_lat, pickup_lng FROM rides WHERE booked_at >= %s", (since,))
-        return sum(1 for r in rows if Location(r["pickup_lat"], r["pickup_lng"]).distance_km(pickup) <= radius_km)
+    def count_riders_near(self, pickup: Location, radius_km: float, since: datetime, excluding_user_id: str) -> int:
+        rows = self._all("SELECT user_id, pickup_lat, pickup_lng FROM rides WHERE booked_at >= %s AND user_id <> %s",
+                         (since, excluding_user_id))
+        return len({r["user_id"] for r in rows
+                    if Location(r["pickup_lat"], r["pickup_lng"]).distance_km(pickup) <= radius_km})
 
     def modify(self, ride_id: str, change: RideChange) -> Ride:
         ride = self._locked("id = %s", ride_id, change)
@@ -173,6 +180,7 @@ class PostgresRideRepository(_Base, RideRepository):
             if row is None:
                 return None
             ride = _ride(row)
+            was_active = ride.is_active
             change(ride)
             conn.execute(
                 "UPDATE rides SET status = %s, picked_up_at = %s, ended_at = %s, last_lat = %s, last_lng = %s, "
@@ -180,6 +188,14 @@ class PostgresRideRepository(_Base, RideRepository):
                 (ride.status.value, ride.picked_up_at, ride.ended_at, ride.last_location.lat,
                  ride.last_location.lng, ride.distance_km, Jsonb(asdict(ride.fare)) if ride.fare else None,
                  ride.cancellation_fee, ride.id))
+            if was_active and not ride.is_active:
+                conn.execute("UPDATE drivers SET status = 'available' WHERE id = %s", (ride.driver_id,))
+                if ride.status == RideStatus.COMPLETED:
+                    # Skipped if the driver reported a newer location while the ride was being ended.
+                    conn.execute("UPDATE drivers SET lat = %s, lng = %s, last_seen_at = %s "
+                                 "WHERE id = %s AND last_seen_at <= %s",
+                                 (ride.last_location.lat, ride.last_location.lng, ride.ended_at,
+                                  ride.driver_id, ride.ended_at))
             return ride
 
 

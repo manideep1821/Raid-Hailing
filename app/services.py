@@ -114,26 +114,21 @@ class RideService:
         if any(r.is_active for r in self.rides.for_user(user_id)):
             raise InvalidRideStateError("user already has an active ride")
         strategy = matching or self.matching
-        surge_multiplier = self.surge.multiplier(pickup)
+        surge_multiplier = self.surge.multiplier(pickup, user_id)
         seen_since = self.clock() - self.driver_timeout
 
         for candidate_type in upgrade_chain(car_type, self.upgrade_path):
             candidates = self.drivers.find_available(pickup, radius_km, seen_since, candidate_type)
             for driver in strategy.rank(candidates, pickup):
-                # Losing the claim means a concurrent booking took this driver; try the next one.
-                if not self.drivers.try_claim(driver.id):
-                    continue
                 ride = Ride(
                     id=_new_id("R"), user_id=user_id, driver_id=driver.id,
                     requested_car_type=car_type, assigned_car_type=candidate_type,
                     pickup=pickup, last_location=pickup, coupon=coupon, surge_multiplier=surge_multiplier,
                     booked_at=self.clock(),
                 )
-                try:
-                    return self.rides.create(ride)
-                except InvalidRideStateError:
-                    self.drivers.release(driver.id)
-                    raise
+                # False means a concurrent booking claimed this driver first; try the next one.
+                if self.rides.create(ride):
+                    return ride
         raise NoDriverAvailableError(f"no {car_type.value} available within {radius_km} km")
 
     def start(self, ride_id: str) -> Ride:
@@ -154,10 +149,8 @@ class RideService:
             ride.fare = self.pricing.price_ride(ride)
             ride.status = RideStatus.COMPLETED
             ride.ended_at = self.clock()
-        ride = self.rides.modify(ride_id, finish)
-        self.drivers.update_location(ride.driver_id, ride.last_location, ride.ended_at)
-        self.drivers.release(ride.driver_id)
-        return ride
+        # Closing the ride also frees the driver at the drop point, in the same transaction.
+        return self.rides.modify(ride_id, finish)
 
     def cancel(self, ride_id: str) -> Ride:
         def cancel_before_pickup(ride: Ride) -> None:
@@ -165,10 +158,8 @@ class RideService:
             ride.ended_at = self.clock()
             ride.cancellation_fee = self.cancellation.fee(ride, ride.ended_at)
             ride.status = RideStatus.CANCELLED
-        ride = self.rides.modify(ride_id, cancel_before_pickup)
-        # The driver never reached the pickup: leave them where they are.
-        self.drivers.release(ride.driver_id)
-        return ride
+        # Frees the driver in the same transaction, where they are: they never reached the pickup.
+        return self.rides.modify(ride_id, cancel_before_pickup)
 
     def history_for_user(self, user_id: str) -> Dict[str, List[Ride]]:
         self.users.get(user_id)

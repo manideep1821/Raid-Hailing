@@ -5,13 +5,13 @@ CREATE TABLE IF NOT EXISTS schema_version (version INT NOT NULL);
 CREATE TABLE IF NOT EXISTS users (
     id    TEXT PRIMARY KEY,
     name  TEXT NOT NULL,
-    phone TEXT NOT NULL
+    phone TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS drivers (
     id       TEXT PRIMARY KEY,
     name     TEXT NOT NULL,
-    phone    TEXT NOT NULL,
+    phone    TEXT NOT NULL UNIQUE,
     car_type TEXT NOT NULL,
     lat      DOUBLE PRECISION NOT NULL,
     lng      DOUBLE PRECISION NOT NULL,
