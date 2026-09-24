@@ -10,11 +10,11 @@ class CancellationPolicy(ABC):
 
 
 class GracePeriodCancellationPolicy(CancellationPolicy):
-    """Free within the grace window after booking, flat fee afterwards."""
+    """Free within the grace window after booking, flat fee afterwards (only a booked ride can be cancelled)."""
 
     def __init__(self, grace: timedelta, fee_amount: float):
         self.grace = grace
         self.fee_amount = fee_amount
 
     def fee(self, ride: Ride, cancelled_at: datetime) -> float:
-        return 0.0 if cancelled_at - ride.started_at <= self.grace else self.fee_amount
+        return 0.0 if cancelled_at - ride.booked_at <= self.grace else self.fee_amount

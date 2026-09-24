@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
 from app.exceptions import ValidationError
-from app.models import CarType, Coupon, DiscountType, Location
+from app.models import CarType, Coupon, FareBreakdown, Ride
 
 
 class FareStrategy(ABC):
@@ -37,55 +37,19 @@ class TieredFareStrategy(FareStrategy):
         return max(cost, self.min_fare)
 
 
-class SurgeStrategy(ABC):
-    @abstractmethod
-    def multiplier(self, location: Location) -> float: ...
-
-
-class NoSurge(SurgeStrategy):
-    def multiplier(self, location: Location) -> float:
-        return 1.0
-
-
-class GridDemandSurge(SurgeStrategy):
-    """Surge per coarse lat/lng grid cell, derived from demand/supply ratio and capped."""
-
-    def __init__(self, cell_size_deg: float = 0.01, cap: float = 3.0):
-        self.cell_size_deg = cell_size_deg
-        self.cap = cap
-        self._multipliers: Dict[Tuple[int, int], float] = {}
-
-    def _cell(self, location: Location) -> Tuple[int, int]:
-        return (int(location.lat // self.cell_size_deg), int(location.lng // self.cell_size_deg))
-
-    def record_demand_supply(self, location: Location, demand: int, supply: int) -> None:
-        ratio = demand / supply if supply else self.cap
-        self._multipliers[self._cell(location)] = min(max(1.0, ratio), self.cap)
-
-    def multiplier(self, location: Location) -> float:
-        return self._multipliers.get(self._cell(location), 1.0)
-
-
-def apply_coupon(fare: float, coupon: Coupon) -> float:
-    if coupon.discount_type == DiscountType.FLAT:
-        discount = coupon.value
-    else:
-        discount = fare * coupon.value / 100
-    if coupon.max_discount is not None:
-        discount = min(discount, coupon.max_discount)
-    return max(fare - discount, 0.0)
-
-
 class PricingEngine:
-    """Fare = car-type tiered fare x surge, then coupon discount."""
+    """Fare = car-type tiered fare (minimum applied) x surge, minus the coupon discount."""
 
-    def __init__(self, fare_strategies: Dict[CarType, FareStrategy], surge: Optional[SurgeStrategy] = None):
+    def __init__(self, fare_strategies: Dict[CarType, FareStrategy]):
         self.fare_strategies = fare_strategies
-        self.surge = surge or NoSurge()
 
-    def calculate(self, car_type: CarType, distance_km: float, pickup: Location,
-                  coupon: Optional[Coupon] = None) -> float:
-        fare = self.fare_strategies[car_type].base_fare(distance_km) * self.surge.multiplier(pickup)
-        if coupon:
-            fare = apply_coupon(fare, coupon)
-        return round(fare, 2)
+    def calculate(self, car_type: CarType, distance_km: float, surge_multiplier: float = 1.0,
+                  coupon: Optional[Coupon] = None) -> FareBreakdown:
+        base = round(self.fare_strategies[car_type].base_fare(distance_km), 2)
+        surged = round(base * surge_multiplier, 2)
+        discount = round(min(coupon.discount.amount(surged), surged), 2) if coupon else 0.0
+        return FareBreakdown(base, surge_multiplier, surged, discount, round(surged - discount, 2))
+
+    def price_ride(self, ride: Ride) -> FareBreakdown:
+        """Bills the *requested* car type, so an upgrade is free for the rider."""
+        return self.calculate(ride.requested_car_type, ride.distance_km, ride.surge_multiplier, ride.coupon)

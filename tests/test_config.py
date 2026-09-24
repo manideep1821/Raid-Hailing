@@ -36,6 +36,8 @@ def test_values_are_mapped():
     assert config.cancellation_fee == 25
     assert config.fare_strategies[CarType.HATCHBACK].base_fare(10) == 69
     assert config.surge.enabled is False
+    assert config.surge.window == timedelta(minutes=15)
+    assert (config.surge.area_radius_km, config.surge.cap) == (2.0, 2.0)
 
 
 def test_rides_config_env_var_selects_file(monkeypatch, tmp_path):
@@ -69,11 +71,14 @@ def test_missing_or_malformed_file(tmp_path):
     (lambda r: r["pricing"]["sedan"]["tiers"][0].update(rate_per_km="ten"), "not supported"),
     (lambda r: r["booking"].update(default_radius_km=0), "default_radius_km must be > 0"),
     (lambda r: r["booking"].update(default_matching_strategy="cheapest"), "unknown matching strategy"),
-    (lambda r: r["booking"]["upgrades"].update(sedan="sedan"), "cannot upgrade to itself"),
+    (lambda r: r["booking"]["upgrades"].update(sedan="sedan"), "upgrade cycle: .*sedan -> sedan"),
+    (lambda r: r["booking"]["upgrades"].update(sedan="hatchback"), "upgrade cycle: hatchback -> sedan -> hatchback"),
     (lambda r: r["booking"]["upgrades"].update(hatchback="limo"), "unknown car type 'limo'"),
     (lambda r: r["cancellation"].update(fee=-1), "cancellation.fee"),
     (lambda r: r["cancellation"].pop("grace_period_minutes"), "missing key 'grace_period_minutes'"),
     (lambda r: r["surge"].update(cap=0.5), "surge.cap"),
+    (lambda r: r["surge"].update(area_radius_km=0), "surge.area_radius_km"),
+    (lambda r: r["surge"].update(window_minutes=0), "surge.window_minutes"),
     (lambda r: r["surge"].update(enabled="yes"), "surge.enabled"),
     (lambda r: r["database"].update(pool_size=0), "pool_size"),
 ])
@@ -99,7 +104,7 @@ def test_default_radius_from_config():
     user, _ = setup(c, km_north=3)
     with pytest.raises(NoDriverAvailableError, match="1.0 km"):
         c.rides.book(user.id, PICKUP, CarType.SEDAN)
-    assert c.rides.book(user.id, PICKUP, CarType.SEDAN, radius_km=4).status.value == "ongoing"
+    assert c.rides.book(user.id, PICKUP, CarType.SEDAN, radius_km=4).status.value == "booked"
 
 
 def test_default_matching_strategy_from_config():
@@ -137,5 +142,6 @@ def test_prices_from_config():
     c = container_with(cheap_sedan)
     user, driver = setup(c, km_north=0)
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.rides.start(ride.id)
     ended = c.rides.end(ride.id, drop=Location(PICKUP.lat + 20 / 111.195, PICKUP.lng))
-    assert ended.fare == pytest.approx(20, abs=0.05)
+    assert ended.fare.total == pytest.approx(20, abs=0.05)

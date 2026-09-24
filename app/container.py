@@ -5,9 +5,10 @@ from typing import Callable, Optional
 from app.cancellation import GracePeriodCancellationPolicy
 from app.config import AppConfig
 from app.matching import MATCHING_STRATEGIES
-from app.pricing import GridDemandSurge, NoSurge, PricingEngine, SurgeStrategy
+from app.pricing import PricingEngine
 from app.repository import Repositories, in_memory_repositories
 from app.services import CouponService, DriverService, RideService, UserService
+from app.surge import DemandSupplySurge, NoSurge
 
 
 @dataclass
@@ -19,12 +20,11 @@ class Container:
 
 
 def build_container(config: AppConfig, repos: Optional[Repositories] = None,
-                    surge: Optional[SurgeStrategy] = None,
                     clock: Callable[[], datetime] = datetime.now) -> Container:
     repos = repos or in_memory_repositories()
-    if surge is None:
-        surge = (GridDemandSurge(config.surge.cell_size_deg, config.surge.cap)
-                 if config.surge.enabled else NoSurge())
+    s = config.surge
+    surge = (DemandSupplySurge(repos.drivers, repos.rides, s.area_radius_km, s.window, s.cap, clock)
+             if s.enabled else NoSurge())
     coupon_service = CouponService(repos.coupons)
     return Container(
         users=UserService(repos.users),
@@ -32,7 +32,8 @@ def build_container(config: AppConfig, repos: Optional[Repositories] = None,
         coupons=coupon_service,
         rides=RideService(
             repos.users, repos.drivers, repos.rides, coupon_service,
-            pricing=PricingEngine(config.fare_strategies, surge),
+            pricing=PricingEngine(config.fare_strategies),
+            surge=surge,
             matching=MATCHING_STRATEGIES[config.default_matching_strategy],
             cancellation=GracePeriodCancellationPolicy(config.cancellation_grace, config.cancellation_fee),
             upgrade_path=config.upgrade_path,

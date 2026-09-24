@@ -22,7 +22,8 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class SurgeConfig:
     enabled: bool
-    cell_size_deg: float
+    area_radius_km: float
+    window: timedelta
     cap: float
 
 
@@ -86,6 +87,14 @@ def _fare_strategy(name: str, spec: Dict[str, Any]) -> FareStrategy:
         raise ConfigError(f"pricing.{name}: {e}")
 
 
+def _check_no_upgrade_cycle(upgrades: Dict[CarType, CarType]) -> None:
+    for start in upgrades:
+        path = [start]
+        while path[-1] in upgrades:
+            path.append(upgrades[path[-1]])
+            _check(path[-1] not in path[:-1], f"upgrade cycle: {' -> '.join(t.value for t in path)}")
+
+
 def _parse(raw: Dict[str, Any]) -> AppConfig:
     booking, cancellation, surge, db = raw["booking"], raw["cancellation"], raw["surge"], raw["database"]
 
@@ -94,7 +103,7 @@ def _parse(raw: Dict[str, Any]) -> AppConfig:
     _check(not missing, f"pricing missing for car type(s): {', '.join(missing)}")
 
     upgrades = {_car_type(k): _car_type(v) for k, v in booking.get("upgrades", {}).items()}
-    _check(all(k != v for k, v in upgrades.items()), "a car type cannot upgrade to itself")
+    _check_no_upgrade_cycle(upgrades)
 
     _check(booking["default_radius_km"] > 0, "booking.default_radius_km must be > 0")
     strategy = booking["default_matching_strategy"]
@@ -105,7 +114,8 @@ def _parse(raw: Dict[str, Any]) -> AppConfig:
     _check(cancellation["fee"] >= 0, "cancellation.fee must be >= 0")
 
     _check(isinstance(surge["enabled"], bool), "surge.enabled must be true or false")
-    _check(surge["cell_size_deg"] > 0, "surge.cell_size_deg must be > 0")
+    _check(surge["area_radius_km"] > 0, "surge.area_radius_km must be > 0")
+    _check(surge["window_minutes"] > 0, "surge.window_minutes must be > 0")
     _check(surge["cap"] >= 1, "surge.cap must be >= 1")
 
     _check(db["pool_size"] >= 1, "database.pool_size must be >= 1")
@@ -117,7 +127,8 @@ def _parse(raw: Dict[str, Any]) -> AppConfig:
         default_matching_strategy=strategy,
         cancellation_grace=timedelta(minutes=cancellation["grace_period_minutes"]),
         cancellation_fee=float(cancellation["fee"]),
-        surge=SurgeConfig(surge["enabled"], float(surge["cell_size_deg"]), float(surge["cap"])),
+        surge=SurgeConfig(surge["enabled"], float(surge["area_radius_km"]),
+                          timedelta(minutes=surge["window_minutes"]), float(surge["cap"])),
         database_url=os.environ.get("DATABASE_URL") or db["url"],
         db_pool_size=int(db["pool_size"]),
     )

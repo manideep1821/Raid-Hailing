@@ -31,10 +31,12 @@ tiers = [
 grace_period_minutes = 2   # free to cancel within this window after booking
 fee = 25
 
+# Multiplier = demand / supply near the pickup, within [1, cap]; locked onto the ride at booking.
 [surge]
-enabled = false
-cell_size_deg = 0.01       # grid cell (~1.1 km) that demand/supply is tracked per
-cap = 3.0
+enabled = true
+area_radius_km = 2.0       # demand and supply are counted within this distance of the pickup
+window_minutes = 15        # bookings this recent count as demand
+cap = 2.0
 
 [database]
 url = "postgresql://rides:rides@localhost:5433/rides"

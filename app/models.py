@@ -4,6 +4,8 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
+from app.discounts import Discount
+
 EARTH_RADIUS_KM = 6371.0
 
 
@@ -30,14 +32,13 @@ class DriverStatus(str, Enum):
 
 
 class RideStatus(str, Enum):
-    ONGOING = "ongoing"
+    BOOKED = "booked"        # driver assigned, on the way to the pickup
+    ONGOING = "ongoing"      # rider picked up; the route (and the fare) is measured from here
     COMPLETED = "completed"
     CANCELLED = "cancelled"
 
 
-class DiscountType(str, Enum):
-    FLAT = "flat"
-    PERCENTAGE = "percentage"
+ACTIVE_RIDE_STATUSES = (RideStatus.BOOKED, RideStatus.ONGOING)
 
 
 @dataclass
@@ -61,9 +62,16 @@ class Driver:
 @dataclass
 class Coupon:
     code: str
-    discount_type: DiscountType
-    value: float
-    max_discount: Optional[float] = None
+    discount: Discount
+
+
+@dataclass(frozen=True)
+class FareBreakdown:
+    base_fare: float         # tiered fare for the billed car type, minimum fare applied
+    surge_multiplier: float
+    surged_fare: float
+    discount: float
+    total: float
 
 
 @dataclass
@@ -76,16 +84,22 @@ class Ride:
     pickup: Location
     route: List[Location]
     coupon: Optional[Coupon] = None  # snapshot validated at booking
-    status: RideStatus = RideStatus.ONGOING
-    started_at: datetime = field(default_factory=datetime.now)
+    surge_multiplier: float = 1.0    # locked at booking
+    status: RideStatus = RideStatus.BOOKED
+    booked_at: datetime = field(default_factory=datetime.now)
+    picked_up_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     distance_km: Optional[float] = None
-    fare: Optional[float] = None
+    fare: Optional[FareBreakdown] = None
     cancellation_fee: Optional[float] = None
 
     @property
     def upgraded(self) -> bool:
         return self.requested_car_type != self.assigned_car_type
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in ACTIVE_RIDE_STATUSES
 
     def route_distance_km(self) -> float:
         return sum(a.distance_km(b) for a, b in zip(self.route, self.route[1:]))

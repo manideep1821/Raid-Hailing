@@ -8,6 +8,7 @@ import copy
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from app.exceptions import InvalidRideStateError, NotFoundError, ValidationError
@@ -30,7 +31,9 @@ class DriverRepository(ABC):
     def get(self, driver_id: str) -> Driver: ...
 
     @abstractmethod
-    def find_available(self, pickup: Location, radius_km: float, car_type: CarType) -> List[Driver]: ...
+    def find_available(self, pickup: Location, radius_km: float,
+                       car_type: Optional[CarType] = None) -> List[Driver]:
+        """Available drivers within the radius; all car types when `car_type` is None."""
 
     @abstractmethod
     def update_location(self, driver_id: str, location: Location) -> Driver: ...
@@ -47,7 +50,7 @@ class DriverRepository(ABC):
 class RideRepository(ABC):
     @abstractmethod
     def create(self, ride: Ride) -> Ride:
-        """Insert an ongoing ride; InvalidRideStateError if the user already has one."""
+        """Insert a booked ride; InvalidRideStateError if the user already has an active one."""
 
     @abstractmethod
     def get(self, ride_id: str) -> Ride: ...
@@ -59,12 +62,21 @@ class RideRepository(ABC):
     def for_driver(self, driver_id: str) -> List[Ride]: ...
 
     @abstractmethod
-    def append_route_point(self, driver_id: str, location: Location) -> None:
-        """Extend the route of the driver's ongoing ride, if any."""
+    def count_booked_near(self, pickup: Location, radius_km: float, since: datetime) -> int:
+        """Rides booked at or after `since` whose pickup is within the radius."""
 
     @abstractmethod
-    def close(self, ride: Ride) -> bool:
-        """Persist a completed/cancelled ride only if it is still ongoing in storage."""
+    def start(self, ride_id: str, picked_up_at: datetime) -> bool:
+        """Atomically BOOKED -> ONGOING. False if the ride is no longer booked."""
+
+    @abstractmethod
+    def append_route_point(self, driver_id: str, location: Location) -> None:
+        """Extend the route of the driver's ONGOING ride (rider on board), if any."""
+
+    @abstractmethod
+    def close(self, ride: Ride, expected_status: RideStatus, expected_route_len: int) -> bool:
+        """Persist a completed/cancelled ride only if storage still has it in `expected_status`
+        with `expected_route_len` route points, i.e. nothing changed since it was read."""
 
 
 class CouponRepository(ABC):
@@ -117,11 +129,12 @@ class InMemoryDriverRepository(DriverRepository):
     def get(self, driver_id: str) -> Driver:
         return _get(self._items, driver_id, "driver")
 
-    def find_available(self, pickup: Location, radius_km: float, car_type: CarType) -> List[Driver]:
+    def find_available(self, pickup: Location, radius_km: float,
+                       car_type: Optional[CarType] = None) -> List[Driver]:
         return [
             copy.deepcopy(d) for d in list(self._items.values())
             if d.status == DriverStatus.AVAILABLE
-            and d.car_type == car_type
+            and car_type in (None, d.car_type)
             and d.location.distance_km(pickup) <= radius_km
         ]
 
@@ -154,8 +167,8 @@ class InMemoryRideRepository(RideRepository):
 
     def create(self, ride: Ride) -> Ride:
         with self._lock:
-            if any(r.user_id == ride.user_id and r.status == RideStatus.ONGOING for r in self._items.values()):
-                raise InvalidRideStateError("user already has an ongoing ride")
+            if any(r.user_id == ride.user_id and r.is_active for r in self._items.values()):
+                raise InvalidRideStateError("user already has an active ride")
             self._items[ride.id] = copy.deepcopy(ride)
             return ride
 
@@ -168,15 +181,29 @@ class InMemoryRideRepository(RideRepository):
     def for_driver(self, driver_id: str) -> List[Ride]:
         return [copy.deepcopy(r) for r in list(self._items.values()) if r.driver_id == driver_id]
 
+    def count_booked_near(self, pickup: Location, radius_km: float, since: datetime) -> int:
+        return sum(1 for r in list(self._items.values())
+                   if r.booked_at >= since and r.pickup.distance_km(pickup) <= radius_km)
+
+    def start(self, ride_id: str, picked_up_at: datetime) -> bool:
+        with self._lock:
+            ride = self._items.get(ride_id)
+            if ride is None or ride.status != RideStatus.BOOKED:
+                return False
+            ride.status = RideStatus.ONGOING
+            ride.picked_up_at = picked_up_at
+            return True
+
     def append_route_point(self, driver_id: str, location: Location) -> None:
         with self._lock:
             for r in self._items.values():
                 if r.driver_id == driver_id and r.status == RideStatus.ONGOING:
                     r.route.append(location)
 
-    def close(self, ride: Ride) -> bool:
+    def close(self, ride: Ride, expected_status: RideStatus, expected_route_len: int) -> bool:
         with self._lock:
-            if self._items[ride.id].status != RideStatus.ONGOING:
+            stored = self._items[ride.id]
+            if stored.status != expected_status or len(stored.route) != expected_route_len:
                 return False
             self._items[ride.id] = copy.deepcopy(ride)
             return True

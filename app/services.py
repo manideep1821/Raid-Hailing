@@ -3,11 +3,13 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 from app.cancellation import CancellationPolicy
+from app.discounts import Discount
 from app.exceptions import InvalidCouponError, InvalidRideStateError, NoDriverAvailableError, ValidationError
 from app.matching import MatchingStrategy
-from app.models import CarType, Coupon, DiscountType, Driver, Location, Ride, RideStatus, User
+from app.models import CarType, Coupon, Driver, Location, Ride, RideStatus, User
 from app.pricing import PricingEngine
 from app.repository import CouponRepository, DriverRepository, RideRepository, UserRepository
+from app.surge import SurgeStrategy
 
 
 def _new_id(prefix: str) -> str:
@@ -17,6 +19,16 @@ def _new_id(prefix: str) -> str:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValidationError(message)
+
+
+def upgrade_chain(requested: CarType, upgrade_path: Dict[CarType, CarType]) -> List[CarType]:
+    """The requested type, then each free upgrade in turn, e.g. hatchback -> sedan -> ..."""
+    chain = [requested]
+    upgrade = upgrade_path.get(requested)
+    while upgrade is not None and upgrade not in chain:
+        chain.append(upgrade)
+        upgrade = upgrade_path.get(upgrade)
+    return chain
 
 
 class UserService:
@@ -52,14 +64,10 @@ class CouponService:
     def __init__(self, coupons: CouponRepository):
         self.coupons = coupons
 
-    def add(self, code: str, discount_type: DiscountType, value: float,
-            max_discount: Optional[float] = None) -> Coupon:
+    def add(self, code: str, discount: Discount) -> Coupon:
         code = code.strip().upper()
         _require(bool(code), "coupon code is required")
-        _require(value > 0, "discount value must be positive")
-        _require(discount_type != DiscountType.PERCENTAGE or value <= 100, "percentage must be <= 100")
-        _require(max_discount is None or max_discount > 0, "max_discount must be positive")
-        return self.coupons.add(Coupon(code, discount_type, value, max_discount))
+        return self.coupons.add(Coupon(code, discount))
 
     def delete(self, code: str) -> None:
         self.coupons.delete(code.strip().upper())
@@ -73,17 +81,19 @@ class CouponService:
 
 class RideService:
     def __init__(self, users: UserRepository, drivers: DriverRepository, rides: RideRepository,
-                 coupon_service: CouponService, pricing: PricingEngine, matching: MatchingStrategy,
-                 cancellation: CancellationPolicy, upgrade_path: Dict[CarType, CarType],
-                 default_radius_km: float, clock: Callable[[], datetime] = datetime.now):
+                 coupon_service: CouponService, pricing: PricingEngine, surge: SurgeStrategy,
+                 matching: MatchingStrategy, cancellation: CancellationPolicy,
+                 upgrade_path: Dict[CarType, CarType], default_radius_km: float,
+                 clock: Callable[[], datetime] = datetime.now):
         self.users = users
         self.drivers = drivers
         self.rides = rides
         self.coupon_service = coupon_service
         self.pricing = pricing
+        self.surge = surge
         self.matching = matching
         self.cancellation = cancellation
-        # Requested type -> type substituted at the requested type's price.
+        # Requested type -> next type tried, still billed at the requested type's price.
         self.upgrade_path = upgrade_path
         self.default_radius_km = default_radius_km
         self.clock = clock
@@ -95,13 +105,12 @@ class RideService:
         radius_km = self.default_radius_km if radius_km is None else radius_km
         _require(radius_km > 0, "radius must be positive")
         coupon = self.coupon_service.validate(coupon_code) if coupon_code else None
-        if any(r.status == RideStatus.ONGOING for r in self.rides.for_user(user_id)):
-            raise InvalidRideStateError("user already has an ongoing ride")
+        if any(r.is_active for r in self.rides.for_user(user_id)):
+            raise InvalidRideStateError("user already has an active ride")
         strategy = matching or self.matching
+        surge_multiplier = self.surge.multiplier(pickup)
 
-        for candidate_type in (car_type, self.upgrade_path.get(car_type)):
-            if candidate_type is None:
-                continue
+        for candidate_type in upgrade_chain(car_type, self.upgrade_path):
             for driver in strategy.rank(self.drivers.find_available(pickup, radius_km, candidate_type), pickup):
                 # Losing the claim means a concurrent booking took this driver; try the next one.
                 if not self.drivers.try_claim(driver.id):
@@ -109,7 +118,8 @@ class RideService:
                 ride = Ride(
                     id=_new_id("R"), user_id=user_id, driver_id=driver.id,
                     requested_car_type=car_type, assigned_car_type=candidate_type,
-                    pickup=pickup, route=[pickup], coupon=coupon, started_at=self.clock(),
+                    pickup=pickup, route=[pickup], coupon=coupon, surge_multiplier=surge_multiplier,
+                    booked_at=self.clock(),
                 )
                 try:
                     return self.rides.create(ride)
@@ -118,24 +128,41 @@ class RideService:
                     raise
         raise NoDriverAvailableError(f"no {car_type.value} available within {radius_km} km")
 
+    def start(self, ride_id: str) -> Ride:
+        """The rider is picked up: from now on location updates extend the billed route."""
+        ride = self._in_status(ride_id, RideStatus.BOOKED, "start")
+        ride.picked_up_at = self.clock()
+        if not self.rides.start(ride.id, ride.picked_up_at):
+            raise InvalidRideStateError(f"ride '{ride.id}' changed while starting it")
+        ride.status = RideStatus.ONGOING
+        return ride
+
     def end(self, ride_id: str, drop: Optional[Location] = None) -> Ride:
-        ride = self._ongoing(ride_id)
-        if drop:
-            ride.route.append(drop)
-        ride.distance_km = round(ride.route_distance_km(), 3)
-        # Priced on the *requested* type: an upgrade is free for the rider.
-        ride.fare = self.pricing.calculate(ride.requested_car_type, ride.distance_km, ride.pickup, ride.coupon)
-        ride.status = RideStatus.COMPLETED
-        ride.ended_at = self.clock()
-        return self._close(ride, driver_location=ride.route[-1])
+        while True:
+            ride = self._in_status(ride_id, RideStatus.ONGOING, "end")
+            points_read = len(ride.route)
+            if drop:
+                ride.route.append(drop)
+            ride.distance_km = round(ride.route_distance_km(), 3)
+            ride.fare = self.pricing.price_ride(ride)
+            ride.status = RideStatus.COMPLETED
+            ride.ended_at = self.clock()
+            if self.rides.close(ride, RideStatus.ONGOING, points_read):
+                break
+            # A location update landed after the read, so the fare missed it: price it again.
+        self.drivers.release(ride.driver_id, ride.route[-1])
+        return ride
 
     def cancel(self, ride_id: str) -> Ride:
-        ride = self._ongoing(ride_id)
+        ride = self._in_status(ride_id, RideStatus.BOOKED, "cancel")
         ride.ended_at = self.clock()
         ride.cancellation_fee = self.cancellation.fee(ride, ride.ended_at)
         ride.status = RideStatus.CANCELLED
-        # The driver never reached the drop (maybe not even the pickup): leave them where they are.
-        return self._close(ride, driver_location=None)
+        if not self.rides.close(ride, RideStatus.BOOKED, len(ride.route)):
+            raise InvalidRideStateError(f"ride '{ride.id}' changed while cancelling it")
+        # The driver never reached the pickup: leave them where they are.
+        self.drivers.release(ride.driver_id)
+        return ride
 
     def history_for_user(self, user_id: str) -> Dict[str, List[Ride]]:
         self.users.get(user_id)
@@ -145,19 +172,19 @@ class RideService:
         self.drivers.get(driver_id)
         return self._partition(self.rides.for_driver(driver_id))
 
-    def _ongoing(self, ride_id: str) -> Ride:
+    def _in_status(self, ride_id: str, expected: RideStatus, action: str) -> Ride:
         ride = self.rides.get(ride_id)
-        if ride.status != RideStatus.ONGOING:
-            raise InvalidRideStateError(f"ride '{ride_id}' is already {ride.status.value}")
-        return ride
-
-    def _close(self, ride: Ride, driver_location: Optional[Location]) -> Ride:
-        if not self.rides.close(ride):
-            raise InvalidRideStateError(f"ride '{ride.id}' was already closed")
-        self.drivers.release(ride.driver_id, driver_location)
+        if ride.status != expected:
+            raise InvalidRideStateError(f"cannot {action} ride '{ride_id}': it is {ride.status.value}, "
+                                        f"not {expected.value}")
         return ride
 
     @staticmethod
     def _partition(rides: List[Ride]) -> Dict[str, List[Ride]]:
-        by_start = sorted(rides, key=lambda r: r.started_at, reverse=True)
-        return {status.value: [r for r in by_start if r.status == status] for status in RideStatus}
+        """Newest first; "ongoing" covers booked rides too (a driver is assigned either way)."""
+        newest_first = sorted(rides, key=lambda r: r.booked_at, reverse=True)
+        return {
+            "ongoing": [r for r in newest_first if r.is_active],
+            RideStatus.COMPLETED.value: [r for r in newest_first if r.status == RideStatus.COMPLETED],
+            RideStatus.CANCELLED.value: [r for r in newest_first if r.status == RideStatus.CANCELLED],
+        }
