@@ -75,7 +75,7 @@ class Ride:
     assigned_car_type: CarType
     pickup: Location
     route: List[Location]
-    coupon_code: Optional[str] = None
+    coupon: Optional[Coupon] = None  # snapshot validated at booking
     status: RideStatus = RideStatus.ONGOING
     started_at: datetime = field(default_factory=datetime.now)
     ended_at: Optional[datetime] = None
