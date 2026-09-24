@@ -195,7 +195,7 @@ def main(argv=None) -> int:
     from psycopg import Error as PostgresError
     from psycopg_pool import PoolTimeout
 
-    from app.postgres import apply_schema, open_pool, postgres_repositories
+    from app.postgres import SchemaOutOfDateError, apply_schema, open_pool, postgres_repositories
     try:
         pool = open_pool(config.database_url, max_size=config.db_pool_size)
     except PoolTimeout:
@@ -204,7 +204,7 @@ def main(argv=None) -> int:
     try:
         try:
             apply_schema(pool)
-        except PostgresError as e:
+        except (PostgresError, SchemaOutOfDateError) as e:
             print(f"error: the database schema is out of date ({e}); reset it with "
                   "`docker compose down -v && docker compose up -d --wait`", file=sys.stderr)
             return 2

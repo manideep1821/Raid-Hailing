@@ -1,3 +1,7 @@
+-- There are no migrations: bump SCHEMA_VERSION in app/postgres.py when a table changes,
+-- and an older database is refused with instructions to reset it.
+CREATE TABLE IF NOT EXISTS schema_version (version INT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS users (
     id    TEXT PRIMARY KEY,
     name  TEXT NOT NULL,
@@ -11,8 +15,9 @@ CREATE TABLE IF NOT EXISTS drivers (
     car_type TEXT NOT NULL,
     lat      DOUBLE PRECISION NOT NULL,
     lng      DOUBLE PRECISION NOT NULL,
-    rating   DOUBLE PRECISION NOT NULL,
-    status   TEXT NOT NULL
+    rating       DOUBLE PRECISION NOT NULL,
+    status       TEXT NOT NULL,
+    last_seen_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS drivers_available_idx ON drivers (car_type) WHERE status = 'available';
 
@@ -30,14 +35,15 @@ CREATE TABLE IF NOT EXISTS rides (
     assigned_car_type  TEXT NOT NULL,
     pickup_lat         DOUBLE PRECISION NOT NULL,
     pickup_lng         DOUBLE PRECISION NOT NULL,
-    route              JSONB NOT NULL,
+    last_lat           DOUBLE PRECISION NOT NULL,   -- running distance is measured up to here
+    last_lng           DOUBLE PRECISION NOT NULL,
+    distance_km        DOUBLE PRECISION NOT NULL,
     coupon             JSONB,             -- {code, kind, params} snapshot taken at booking
     surge_multiplier   DOUBLE PRECISION NOT NULL,
     status             TEXT NOT NULL,
     booked_at          TIMESTAMP NOT NULL,
     picked_up_at       TIMESTAMP,
     ended_at           TIMESTAMP,
-    distance_km        DOUBLE PRECISION,
     fare               JSONB,             -- FareBreakdown
     cancellation_fee   DOUBLE PRECISION
 );

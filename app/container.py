@@ -23,12 +23,13 @@ def build_container(config: AppConfig, repos: Optional[Repositories] = None,
                     clock: Callable[[], datetime] = datetime.now) -> Container:
     repos = repos or in_memory_repositories()
     s = config.surge
-    surge = (DemandSupplySurge(repos.drivers, repos.rides, s.area_radius_km, s.window, s.cap, clock)
+    surge = (DemandSupplySurge(repos.drivers, repos.rides, s.area_radius_km, s.window, s.cap,
+                               config.driver_timeout, clock)
              if s.enabled else NoSurge())
     coupon_service = CouponService(repos.coupons)
     return Container(
         users=UserService(repos.users),
-        drivers=DriverService(repos.drivers, repos.rides),
+        drivers=DriverService(repos.drivers, repos.rides, clock),
         coupons=coupon_service,
         rides=RideService(
             repos.users, repos.drivers, repos.rides, coupon_service,
@@ -38,6 +39,7 @@ def build_container(config: AppConfig, repos: Optional[Repositories] = None,
             cancellation=GracePeriodCancellationPolicy(config.cancellation_grace, config.cancellation_fee),
             upgrade_path=config.upgrade_path,
             default_radius_km=config.default_radius_km,
+            driver_timeout=config.driver_timeout,
             clock=clock,
         ),
     )

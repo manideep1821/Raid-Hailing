@@ -39,7 +39,7 @@ def c(repos, clock):
 @pytest.fixture
 def surge(repos, clock):
     return DemandSupplySurge(repos.drivers, repos.rides, area_radius_km=2, window=timedelta(minutes=15),
-                             cap=2.0, clock=clock)
+                             cap=2.0, driver_timeout=timedelta(minutes=60), clock=clock)
 
 
 def add_drivers(c, n, km=0.5, car_type=CarType.SEDAN):
@@ -78,6 +78,17 @@ def test_supply_counts_every_car_type_in_the_area(c, surge):
     add_drivers(c, 1, car_type=CarType.SEDAN)
     book(c, 1)                                   # demand 2, supply 2
     assert surge.multiplier(PICKUP) == 1.0
+
+
+def test_offline_drivers_are_not_supply(c, surge, clock):
+    drivers = add_drivers(c, 3)
+    clock.now += timedelta(minutes=61)
+    for d in drivers[:2]:                                      # the third goes quiet: offline
+        c.drivers.update_location(d.id, north_of(0.5))
+    book(c, 1)
+    # demand 2 (1 recent + this); supply is the 1 online driver left. Counting the offline
+    # driver would make supply 2 and the multiplier 1.0.
+    assert surge.multiplier(PICKUP) == 2.0
 
 
 def test_old_or_far_bookings_are_not_demand(c, surge, clock):

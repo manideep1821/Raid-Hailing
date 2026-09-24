@@ -31,6 +31,7 @@ def test_values_are_mapped():
     config = load_config(TEST_CONFIG_PATH)
     assert config.default_radius_km == 5.0
     assert config.default_matching_strategy == "nearest"
+    assert config.driver_timeout == timedelta(minutes=60)
     assert config.upgrade_path == {CarType.HATCHBACK: CarType.SEDAN}
     assert config.cancellation_grace == timedelta(minutes=2)
     assert config.cancellation_fee == 25
@@ -75,6 +76,7 @@ def test_missing_or_malformed_file(tmp_path):
     (lambda r: r["booking"]["upgrades"].update(sedan="hatchback"), "upgrade cycle: hatchback -> sedan -> hatchback"),
     (lambda r: r["booking"]["upgrades"].update(hatchback="limo"), "unknown car type 'limo'"),
     (lambda r: r["cancellation"].update(fee=-1), "cancellation.fee"),
+    (lambda r: r["drivers"].update(offline_after_minutes=0), "drivers.offline_after_minutes"),
     (lambda r: r["cancellation"].pop("grace_period_minutes"), "missing key 'grace_period_minutes'"),
     (lambda r: r["surge"].update(cap=0.5), "surge.cap"),
     (lambda r: r["surge"].update(area_radius_km=0), "surge.area_radius_km"),

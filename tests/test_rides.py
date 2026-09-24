@@ -1,3 +1,4 @@
+import itertools
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -77,6 +78,26 @@ def test_no_driver_within_radius(c, user):
     add_driver(c, CarType.SEDAN, km_away=8)
     with pytest.raises(NoDriverAvailableError):
         c.rides.book(user.id, PICKUP, CarType.SEDAN, radius_km=5)
+
+
+def test_driver_without_recent_location_is_treated_as_offline(c, user, clock):
+    driver = add_driver(c, CarType.SEDAN)
+    clock.now += CONFIG.driver_timeout + timedelta(seconds=1)
+    with pytest.raises(NoDriverAvailableError):
+        c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.drivers.update_location(driver.id, north_of(PICKUP, 1))     # heartbeat: back online
+    assert c.rides.book(user.id, PICKUP, CarType.SEDAN).driver_id == driver.id
+
+
+def test_ending_a_ride_counts_as_the_driver_being_seen(c, user, clock):
+    driver = add_driver(c, CarType.SEDAN)
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    c.rides.start(ride.id)
+    clock.now += CONFIG.driver_timeout      # a long ride with no updates
+    c.rides.end(ride.id, drop=north_of(PICKUP, 2))
+    assert c.drivers.get(driver.id).last_seen_at == clock.now
+    other = c.users.register("Ravi", "9000000002")
+    assert c.rides.book(other.id, PICKUP, CarType.SEDAN).driver_id == driver.id
 
 
 def test_busy_driver_is_not_rebooked(c, user):
@@ -199,22 +220,36 @@ def test_ride_must_be_started_before_it_is_ended(c, user):
         c.rides.start(ride.id)
 
 
-def test_end_reprices_when_a_location_update_lands_mid_close(c, repos, user, monkeypatch):
+def test_no_location_update_is_lost_or_billed_after_the_ride_ends(c, repos, user):
+    # A driver keeps sending updates while the ride is ended. Each update either lands before
+    # the end (and is billed) or after it (and is ignored); none is half-applied or dropped.
     driver = add_driver(c, CarType.SEDAN, km_away=0)
     ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
     c.rides.start(ride.id)
-    real_close = repos.rides.close
+    applied = [PICKUP]
+    first_update_done, stop = threading.Event(), threading.Event()
 
-    def close_after_a_late_update(*args):
-        monkeypatch.setattr(repos.rides, "close", real_close)      # only the first attempt races
-        c.drivers.update_location(driver.id, north_of(PICKUP, 4))
-        return real_close(*args)
+    def drive():
+        for i in itertools.count():
+            if stop.is_set():
+                return
+            point = north_of(PICKUP, 0.5 * (i % 4 + 1))
+            if repos.rides.modify_ongoing_for_driver(driver.id, lambda r: r.move_to(point)) is not None:
+                applied.append(point)
+            first_update_done.set()
 
-    monkeypatch.setattr(repos.rides, "close", close_after_a_late_update)
-    ended = c.rides.end(ride.id, drop=PICKUP)
-    # The first attempt priced 0 km and was refused; the retry includes the 4 km out and back.
-    assert ended.distance_km == pytest.approx(8, abs=0.01)
-    assert repos.rides.get(ride.id).fare == ended.fare
+    t = threading.Thread(target=drive)
+    t.start()
+    first_update_done.wait()
+    ended = c.rides.end(ride.id)
+    stop.set()
+    t.join()
+
+    expected_km = sum(a.distance_km(b) for a, b in zip(applied, applied[1:]))
+    assert len(applied) > 1
+    assert ended.distance_km == pytest.approx(expected_km, abs=0.001)
+    assert repos.rides.get(ride.id).distance_km == ended.distance_km
+    assert ended.fare.total == pytest.approx(fare(CarType.SEDAN, ended.distance_km), abs=0.01)
 
 
 def test_location_update_when_idle_does_not_touch_rides(c, user):
@@ -222,7 +257,8 @@ def test_location_update_when_idle_does_not_touch_rides(c, user):
     new_loc = north_of(PICKUP, 0.2)
     c.drivers.update_location(driver.id, new_loc)
     assert c.drivers.get(driver.id).location == new_loc
-    assert c.rides.book(user.id, PICKUP, CarType.SEDAN).route == [PICKUP]
+    ride = c.rides.book(user.id, PICKUP, CarType.SEDAN)
+    assert (ride.last_location, ride.distance_km) == (PICKUP, 0)
 
 
 def test_cannot_end_ride_twice(c, user):

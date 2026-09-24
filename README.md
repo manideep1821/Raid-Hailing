@@ -5,7 +5,7 @@
 ```bash
 docker compose up -d --wait            # Postgres 16 on localhost:5433 (dbs: rides, rides_test)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest -q                    # 131 tests; Postgres cases skip if the DB is down
+.venv/bin/pytest -q                    # 138 tests; Postgres cases skip if the DB is down
 .venv/bin/python -m app.demo           # scripted walkthrough of every edge case, in memory
 
 alias rides=".venv/bin/python -m app.cli"
@@ -23,7 +23,7 @@ rides delete-coupon SAVE20
 rides shell --memory                                        # one session, no Postgres needed
 ```
 
-There are no migrations: if a schema change makes the CLI report an out-of-date schema, reset the local DB with `docker compose down -v && docker compose up -d --wait`. The test DB is rebuilt on every test run.
+There are no migrations: `schema.sql` carries a version, and if the CLI reports an out-of-date schema, reset the local DB with `docker compose down -v && docker compose up -d --wait`. The test DB is rebuilt on every test run.
 
 ## Configuration
 
@@ -35,6 +35,7 @@ All business values live in [`config.toml`](config.toml). None are hard-coded in
 | Free-upgrade path | `[booking.upgrades]` e.g. `hatchback = "sedan"`; entries chain (`sedan = "suv"` makes hatchback → sedan → suv); remove to disable |
 | Default search radius | `booking.default_radius_km` (overridable per booking with `--radius`) |
 | Default matching strategy | `booking.default_matching_strategy` (overridable per booking with `--strategy`) |
+| Driver offline timeout | `drivers.offline_after_minutes`: no location update for this long → not matched, not surge supply |
 | Cancellation window + fee | `cancellation.grace_period_minutes`, `cancellation.fee` |
 | Surge | `surge.enabled`, `surge.area_radius_km`, `surge.window_minutes`, `surge.cap` |
 | Database | `database.url`, `database.pool_size` |
@@ -49,7 +50,7 @@ The tests use their own pinned [`tests/config.test.toml`](tests/config.test.toml
 
 | Layer | File | Responsibility |
 |---|---|---|
-| Domain | `app/models.py` | Entities, ride lifecycle, `FareBreakdown`, haversine distance, route distance |
+| Domain | `app/models.py` | Entities, ride lifecycle, `FareBreakdown`, haversine distance, running ride distance |
 | Pricing | `app/pricing.py` | `FareStrategy` (tiered, per car type), `PricingEngine` (breakdown; bills the requested type) |
 | Discounts | `app/discounts.py` | `Discount` types (flat, percentage with cap) and their registry |
 | Surge | `app/surge.py` | `SurgeStrategy`: none, or demand/supply near the pickup |
@@ -67,12 +68,13 @@ The tests use their own pinned [`tests/config.test.toml`](tests/config.test.toml
 - **Rates** (shipped `config.toml`): Hatchback uses the spec example exactly (min ₹50, 10/8/5). Sedan: min ₹60, 12/10/7.
 - **Upgrade** only goes Hatchback → Sedan, never downward. An upgraded ride is **priced at the requested type's rate**, and the ride records both requested and assigned car types.
 - **Ride lifecycle**: `booked` (driver assigned, heading to the pickup) → `ongoing` (`start`: rider on board) → `completed`, or `booked` → `cancelled`. Ride history shows booked and ongoing rides together under "ongoing".
-- **Distance** is the sum of the legs along the ride's route: the pickup point, every `update-location` sent after `start`, and the optional drop point. The driver's approach to the pickup is not billed. Distances are straight-line (haversine), not road distances.
+- **Distance** is the sum of the legs along the ride's route: the pickup point, every `update-location` sent after `start`, and the optional drop point. It is kept as a running total (plus the last point), not as a stored route. The driver's approach to the pickup is not billed. Distances are straight-line (haversine), not road distances.
+- **Drivers go offline by silence**: a driver with no location update for `drivers.offline_after_minutes` isn't matched or counted as surge supply. Any update (and ending a ride) counts as a heartbeat. The shipped 30 minutes suits manual CLI use; an app sending heartbeats every few seconds would use about a minute.
 - **Coupons** are validated when the ride is **booked** (the spec says "when starting a ride") and applied to the final fare. The coupon is snapshotted onto the ride, so deleting it mid-ride doesn't change what the rider was promised. Discounts are flat or percentage with an optional cap, never below ₹0, and applied after surge. Codes are case-insensitive, and coupons are unlimited-use with no expiry.
 - A user can have at most one ongoing ride. The shipped default search radius is 5 km.
 - Cancellation is only possible before pickup. It is free within 2 minutes of booking and ₹25 after that (shipped config). A cancelled ride leaves the driver at their last reported location.
 - **Surge** is computed once, at booking, and locked onto the ride like the coupon. Demand = rides booked within 2 km of the pickup in the last 15 minutes (cancelled ones included, as they were requests), plus this one; supply = available drivers of any type within 2 km. Multiplier = demand / supply within [1, cap]; the cap applies when there is no supply.
-- No auth, payments, driver acceptance step, or driver on/offline toggle.
+- No auth, payments, driver acceptance step, or explicit driver on/offline toggle.
 
 ## Key design decisions & trade-offs
 
@@ -83,24 +85,33 @@ The tests use their own pinned [`tests/config.test.toml`](tests/config.test.toml
 - **Config has no code fallbacks.** Services receive every value through their constructors, and `config.toml` is the single source of truth. Tests pin their own config file.
 - **Concurrency is enforced in storage, not in an app lock.** A CLI runs each command in a new process, so a `threading.Lock` would protect nothing. Instead:
   - booking claims a driver with `UPDATE drivers SET status='on_ride' WHERE id=? AND status='available'`. Whoever loses the claim moves on to the next ranked driver;
-  - start/end/cancel are conditional on the expected status, so a ride can't be started or closed twice;
-  - `end` prices the route it read, and its write also requires the stored route to be the same length. If a location update landed in between, the write is refused and `end` prices the route again;
+  - every change to a ride (start, a location update's leg, end, cancel) goes through `RideRepository.modify(ride_id, change)`: a `SELECT … FOR UPDATE` row lock, the change, and the write, in one transaction. The service passes the change as a function, so the rules (status checks, pricing) stay in the service while the storage decides how to make it atomic. So a ride can't be started or closed twice, and a location update lands either before `end` (and is billed) or after it (and is ignored), never lost in between;
   - partial unique indexes guarantee one active (booked or ongoing) ride per user and per driver.
 
-  The in-memory repository implements the same contract with locks, and hands out **copies** so it behaves like a database. The ride test suite runs against both backends, including a 20-thread race for 3 drivers.
-- **Driver search** reads the available drivers of the requested type from SQL and applies the radius check in Python. That's fine at this scale; see below for the scalable version.
-- **Surge reads live state** from the repositories rather than keeping its own, so it works across CLI processes. It filters recent rides in Python; see below for the scalable version.
+  The in-memory repository implements the same contract with locks, and hands out **copies** so it behaves like a database. The ride test suite runs against both backends, including a 20-thread race for 3 drivers and location updates racing `end`.
+- **Running distance, not a stored route.** Each location update adds one leg to `distance_km` and moves `last_location`: constant work per update, no growing column. The trade-off is that the route itself isn't kept; see Scaling.
+- **Surge reads live state** from the repositories rather than keeping its own, so it works across CLI processes.
 - Money is stored as `float`, rounded to 2 decimal places at the pricing boundary.
+
+## Scaling: where this breaks first, and the fix
+
+| Bottleneck today | Fix |
+|---|---|
+| `find_available` loads every available driver of a type and checks the radius in Python: cost grows with all drivers, in every city. | PostGIS `geography` column + GiST index: `ST_DWithin` to filter and `ORDER BY location <-> pickup LIMIT k` for nearest. At higher scale, live positions in Redis `GEOSEARCH` or H3 cells, with Postgres as the record of rides. |
+| Driver location updates are Postgres writes; at a heartbeat every few seconds per driver, that is most of the write load. | Live positions in Redis; Postgres only for ride legs. Keep the full route, if needed for disputes, in an append-only `ride_points` table or a stream. |
+| `count_booked_near` scans every ride booked in the last 15 minutes, in all cities, on each booking. | Per-area counters (H3 cell × minute bucket, with a TTL) incremented on booking; a background job computes each cell's smoothed multiplier every few seconds; booking just reads it. Count unique riders so rebooking can't inflate demand. |
+| Hot spots: every booking ranks the same nearest driver first, and the losers of the claim retry down the list. | Pick and claim in one statement: `UPDATE … WHERE id = (SELECT … ORDER BY distance LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`. Works where the matching strategy can be expressed as an `ORDER BY`. |
+| Ride history returns every ride a user has ever taken. | Index `(user_id, booked_at DESC)` and cursor pagination; partition `rides` by month and serve history from a read replica. |
+| One process per CLI command, each opening a pool. | The same services behind an HTTP API (FastAPI), stateless instances behind a load balancer; shard or partition by city, since rides rarely cross cities. |
+| A mobile client retrying `book` after a timeout can book twice. | An idempotency key on `book` and `end`, stored with a unique constraint. |
 
 ## With more time
 
-- PostGIS / geohash index for radius search instead of filtering in the application.
 - `Decimal` / integer paise for money.
-- Surge from precomputed per-area counters (geohash cells updated on booking and driver moves) instead of scanning recent rides; count unique riders so repeated rebooking can't inflate demand.
-- Coupon expiry, usage limits and per-user limits.
-- Driver availability toggle and a driver acceptance/timeout step before `booked`.
-- Migrations (Alembic) instead of an idempotent `schema.sql` applied on startup.
-- An HTTP API over the same services (they're framework-agnostic).
+- Coupon expiry, usage limits and per-user limits (a `coupon_redemptions` table with a unique `(coupon, user)`).
+- A driver acceptance/timeout step before `booked`, with ride events published through an outbox for notifications and billing.
+- Migrations (Alembic) instead of a versioned `schema.sql` that must be reset when it changes.
+- Metrics: match rate, no-driver rate, booking latency, surge by area.
 
 ## How AI was used
 

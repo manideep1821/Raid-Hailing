@@ -58,7 +58,7 @@ def test_car_types_have_different_rates():
 
 
 def ride(requested: CarType, assigned: CarType, km: float, surge: float = 1.0, coupon=None) -> Ride:
-    return Ride("R-1", "U-1", "D-1", requested, assigned, PICKUP, [PICKUP], coupon=coupon,
+    return Ride("R-1", "U-1", "D-1", requested, assigned, PICKUP, PICKUP, coupon=coupon,
                 surge_multiplier=surge, distance_km=km)
 
 

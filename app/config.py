@@ -33,6 +33,7 @@ class AppConfig:
     upgrade_path: Dict[CarType, CarType]
     default_radius_km: float
     default_matching_strategy: str
+    driver_timeout: timedelta
     cancellation_grace: timedelta
     cancellation_fee: float
     surge: SurgeConfig
@@ -110,6 +111,7 @@ def _parse(raw: Dict[str, Any]) -> AppConfig:
     _check(strategy in MATCHING_STRATEGIES,
            f"unknown matching strategy '{strategy}' (known: {', '.join(MATCHING_STRATEGIES)})")
 
+    _check(raw["drivers"]["offline_after_minutes"] > 0, "drivers.offline_after_minutes must be > 0")
     _check(cancellation["grace_period_minutes"] >= 0, "cancellation.grace_period_minutes must be >= 0")
     _check(cancellation["fee"] >= 0, "cancellation.fee must be >= 0")
 
@@ -125,6 +127,7 @@ def _parse(raw: Dict[str, Any]) -> AppConfig:
         upgrade_path=upgrades,
         default_radius_km=float(booking["default_radius_km"]),
         default_matching_strategy=strategy,
+        driver_timeout=timedelta(minutes=raw["drivers"]["offline_after_minutes"]),
         cancellation_grace=timedelta(minutes=cancellation["grace_period_minutes"]),
         cancellation_fee=float(cancellation["fee"]),
         surge=SurgeConfig(surge["enabled"], float(surge["area_radius_km"]),

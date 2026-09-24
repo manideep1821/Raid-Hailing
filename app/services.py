@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
 from app.cancellation import CancellationPolicy
@@ -41,22 +41,26 @@ class UserService:
 
 
 class DriverService:
-    def __init__(self, drivers: DriverRepository, rides: RideRepository):
+    def __init__(self, drivers: DriverRepository, rides: RideRepository,
+                 clock: Callable[[], datetime] = datetime.now):
         self.drivers = drivers
         self.rides = rides
+        self.clock = clock
 
     def register(self, name: str, phone: str, car_type: CarType, location: Location,
                  rating: float = 5.0) -> Driver:
         _require(bool(name.strip()) and bool(phone.strip()), "name and phone are required")
         _require(0 <= rating <= 5, "rating must be between 0 and 5")
-        return self.drivers.add(Driver(_new_id("D"), name.strip(), phone.strip(), car_type, location, rating))
+        return self.drivers.add(Driver(_new_id("D"), name.strip(), phone.strip(), car_type, location, rating,
+                                       last_seen_at=self.clock()))
 
     def get(self, driver_id: str) -> Driver:
         return self.drivers.get(driver_id)
 
     def update_location(self, driver_id: str, location: Location) -> Driver:
-        driver = self.drivers.update_location(driver_id, location)
-        self.rides.append_route_point(driver_id, location)
+        """Also a heartbeat, and, with a rider on board, adds the leg to the ride's distance."""
+        driver = self.drivers.update_location(driver_id, location, self.clock())
+        self.rides.modify_ongoing_for_driver(driver_id, lambda ride: ride.move_to(location))
         return driver
 
 
@@ -83,7 +87,7 @@ class RideService:
     def __init__(self, users: UserRepository, drivers: DriverRepository, rides: RideRepository,
                  coupon_service: CouponService, pricing: PricingEngine, surge: SurgeStrategy,
                  matching: MatchingStrategy, cancellation: CancellationPolicy,
-                 upgrade_path: Dict[CarType, CarType], default_radius_km: float,
+                 upgrade_path: Dict[CarType, CarType], default_radius_km: float, driver_timeout: timedelta,
                  clock: Callable[[], datetime] = datetime.now):
         self.users = users
         self.drivers = drivers
@@ -96,6 +100,8 @@ class RideService:
         # Requested type -> next type tried, still billed at the requested type's price.
         self.upgrade_path = upgrade_path
         self.default_radius_km = default_radius_km
+        # A driver who hasn't sent a location for this long is treated as offline.
+        self.driver_timeout = driver_timeout
         self.clock = clock
 
     def book(self, user_id: str, pickup: Location, car_type: CarType,
@@ -109,16 +115,18 @@ class RideService:
             raise InvalidRideStateError("user already has an active ride")
         strategy = matching or self.matching
         surge_multiplier = self.surge.multiplier(pickup)
+        seen_since = self.clock() - self.driver_timeout
 
         for candidate_type in upgrade_chain(car_type, self.upgrade_path):
-            for driver in strategy.rank(self.drivers.find_available(pickup, radius_km, candidate_type), pickup):
+            candidates = self.drivers.find_available(pickup, radius_km, seen_since, candidate_type)
+            for driver in strategy.rank(candidates, pickup):
                 # Losing the claim means a concurrent booking took this driver; try the next one.
                 if not self.drivers.try_claim(driver.id):
                     continue
                 ride = Ride(
                     id=_new_id("R"), user_id=user_id, driver_id=driver.id,
                     requested_car_type=car_type, assigned_car_type=candidate_type,
-                    pickup=pickup, route=[pickup], coupon=coupon, surge_multiplier=surge_multiplier,
+                    pickup=pickup, last_location=pickup, coupon=coupon, surge_multiplier=surge_multiplier,
                     booked_at=self.clock(),
                 )
                 try:
@@ -129,37 +137,35 @@ class RideService:
         raise NoDriverAvailableError(f"no {car_type.value} available within {radius_km} km")
 
     def start(self, ride_id: str) -> Ride:
-        """The rider is picked up: from now on location updates extend the billed route."""
-        ride = self._in_status(ride_id, RideStatus.BOOKED, "start")
-        ride.picked_up_at = self.clock()
-        if not self.rides.start(ride.id, ride.picked_up_at):
-            raise InvalidRideStateError(f"ride '{ride.id}' changed while starting it")
-        ride.status = RideStatus.ONGOING
-        return ride
+        """The rider is picked up: from now on location updates add to the billed distance."""
+        def pick_up(ride: Ride) -> None:
+            self._require_status(ride, RideStatus.BOOKED, "start")
+            ride.status = RideStatus.ONGOING
+            ride.picked_up_at = self.clock()
+        return self.rides.modify(ride_id, pick_up)
 
     def end(self, ride_id: str, drop: Optional[Location] = None) -> Ride:
-        while True:
-            ride = self._in_status(ride_id, RideStatus.ONGOING, "end")
-            points_read = len(ride.route)
+        # Priced under the ride's lock, so no location update can land between measuring and billing.
+        def finish(ride: Ride) -> None:
+            self._require_status(ride, RideStatus.ONGOING, "end")
             if drop:
-                ride.route.append(drop)
-            ride.distance_km = round(ride.route_distance_km(), 3)
+                ride.move_to(drop)
+            ride.distance_km = round(ride.distance_km, 3)
             ride.fare = self.pricing.price_ride(ride)
             ride.status = RideStatus.COMPLETED
             ride.ended_at = self.clock()
-            if self.rides.close(ride, RideStatus.ONGOING, points_read):
-                break
-            # A location update landed after the read, so the fare missed it: price it again.
-        self.drivers.release(ride.driver_id, ride.route[-1])
+        ride = self.rides.modify(ride_id, finish)
+        self.drivers.update_location(ride.driver_id, ride.last_location, ride.ended_at)
+        self.drivers.release(ride.driver_id)
         return ride
 
     def cancel(self, ride_id: str) -> Ride:
-        ride = self._in_status(ride_id, RideStatus.BOOKED, "cancel")
-        ride.ended_at = self.clock()
-        ride.cancellation_fee = self.cancellation.fee(ride, ride.ended_at)
-        ride.status = RideStatus.CANCELLED
-        if not self.rides.close(ride, RideStatus.BOOKED, len(ride.route)):
-            raise InvalidRideStateError(f"ride '{ride.id}' changed while cancelling it")
+        def cancel_before_pickup(ride: Ride) -> None:
+            self._require_status(ride, RideStatus.BOOKED, "cancel")
+            ride.ended_at = self.clock()
+            ride.cancellation_fee = self.cancellation.fee(ride, ride.ended_at)
+            ride.status = RideStatus.CANCELLED
+        ride = self.rides.modify(ride_id, cancel_before_pickup)
         # The driver never reached the pickup: leave them where they are.
         self.drivers.release(ride.driver_id)
         return ride
@@ -172,12 +178,11 @@ class RideService:
         self.drivers.get(driver_id)
         return self._partition(self.rides.for_driver(driver_id))
 
-    def _in_status(self, ride_id: str, expected: RideStatus, action: str) -> Ride:
-        ride = self.rides.get(ride_id)
+    @staticmethod
+    def _require_status(ride: Ride, expected: RideStatus, action: str) -> None:
         if ride.status != expected:
-            raise InvalidRideStateError(f"cannot {action} ride '{ride_id}': it is {ride.status.value}, "
+            raise InvalidRideStateError(f"cannot {action} ride '{ride.id}': it is {ride.status.value}, "
                                         f"not {expected.value}")
-        return ride
 
     @staticmethod
     def _partition(rides: List[Ride]) -> Dict[str, List[Ride]]:

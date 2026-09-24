@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Optional
 
 from app.discounts import Discount
 
@@ -57,6 +57,7 @@ class Driver:
     location: Location
     rating: float = 5.0
     status: DriverStatus = DriverStatus.AVAILABLE
+    last_seen_at: datetime = field(default_factory=datetime.now)  # last location update from the driver
 
 
 @dataclass
@@ -82,14 +83,14 @@ class Ride:
     requested_car_type: CarType
     assigned_car_type: CarType
     pickup: Location
-    route: List[Location]
+    last_location: Location          # where the running distance was last measured to
     coupon: Optional[Coupon] = None  # snapshot validated at booking
     surge_multiplier: float = 1.0    # locked at booking
     status: RideStatus = RideStatus.BOOKED
     booked_at: datetime = field(default_factory=datetime.now)
     picked_up_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
-    distance_km: Optional[float] = None
+    distance_km: float = 0.0         # accumulated while ONGOING
     fare: Optional[FareBreakdown] = None
     cancellation_fee: Optional[float] = None
 
@@ -101,5 +102,6 @@ class Ride:
     def is_active(self) -> bool:
         return self.status in ACTIVE_RIDE_STATUSES
 
-    def route_distance_km(self) -> float:
-        return sum(a.distance_km(b) for a, b in zip(self.route, self.route[1:]))
+    def move_to(self, location: Location) -> None:
+        self.distance_km += self.last_location.distance_km(location)
+        self.last_location = location

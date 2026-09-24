@@ -26,6 +26,9 @@ tiers = [
     { rate_per_km = 7 },
 ]
 
+[drivers]
+offline_after_minutes = 60
+
 [cancellation]
 grace_period_minutes = 2   # free to cancel within this window after booking
 fee = 25

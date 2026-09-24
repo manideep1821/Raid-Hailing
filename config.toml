@@ -27,6 +27,11 @@ tiers = [
     { rate_per_km = 7 },
 ]
 
+# A driver with no location update for this long is offline: not matched, not surge supply.
+# Generous for manual CLI use; with an app sending heartbeats every few seconds, ~1 minute.
+[drivers]
+offline_after_minutes = 30
+
 [cancellation]
 grace_period_minutes = 2   # free to cancel within this window after booking
 fee = 25
